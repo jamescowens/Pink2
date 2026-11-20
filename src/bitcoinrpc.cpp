@@ -38,6 +38,13 @@
     typedef boost::asio::io_service ioContext;
 #endif
 
+// socket_base::max_connections was renamed max_listen_connections in Boost 1.66 and removed in 1.87
+#if BOOST_VERSION >= 106600
+static const int RPC_LISTEN_BACKLOG = boost::asio::socket_base::max_listen_connections;
+#else
+static const int RPC_LISTEN_BACKLOG = boost::asio::socket_base::max_connections;
+#endif
+
 #define printf OutputDebugStringF
 
 using namespace std;
@@ -621,19 +628,39 @@ void ErrorReply(std::ostream& stream, const Object& objError, const Value& id)
     stream << HTTPReply(nStatus, strReply, false) << std::flush;
 }
 
+// Boost 1.87 removed address_v6::is_v4_compatible(), address_v6::to_v4() and
+// address_v4::to_ulong(). These two helpers do the same tests on the address
+// bytes, with the meaning Boost gave them.
+static bool IsV4Compatible(const asio::ip::address_v6& addr)
+{
+    // ::a.b.c.d, except :: and ::1
+    const asio::ip::address_v6::bytes_type b = addr.to_bytes();
+    for (int i = 0; i < 12; ++i)
+        if (b[i] != 0)
+            return false;
+    return !(b[12] == 0 && b[13] == 0 && b[14] == 0 && (b[15] == 0 || b[15] == 1));
+}
+
+static asio::ip::address_v4 EmbeddedV4(const asio::ip::address_v6& addr)
+{
+    const asio::ip::address_v6::bytes_type b = addr.to_bytes();
+    const asio::ip::address_v4::bytes_type v4 = {{ b[12], b[13], b[14], b[15] }};
+    return asio::ip::address_v4(v4);
+}
+
 bool ClientAllowed(const boost::asio::ip::address& address)
 {
     // Make sure that IPv4-compatible and IPv4-mapped IPv6 addresses are treated as IPv4 addresses
     if (address.is_v6()
-     && (address.to_v6().is_v4_compatible()
+     && (IsV4Compatible(address.to_v6())
       || address.to_v6().is_v4_mapped()))
-        return ClientAllowed(address.to_v6().to_v4());
+        return ClientAllowed(EmbeddedV4(address.to_v6()));
 
     if (address == asio::ip::address_v4::loopback()
      || address == asio::ip::address_v6::loopback()
      || (address.is_v4()
          // Check whether IPv4 addresses match 127.0.0.0/8 (loopback subnet)
-      && (address.to_v4().to_ulong() & 0xff000000) == 0x7f000000))
+      && address.to_v4().to_bytes()[0] == 127))
         return true;
 
     const string strAddress = address.to_string();
@@ -677,15 +704,28 @@ public:
     bool connect(const std::string& server, const std::string& port)
     {
         ip::tcp::resolver resolver(GetIOService(stream));
+        boost::system::error_code error = asio::error::host_not_found;
+#if BOOST_VERSION >= 106600
+        // resolve(host, port, flags) replaces resolver::query and resolver::iterator,
+        // which Boost 1.87 removed. address_configured was query's default.
+        const ip::tcp::resolver::results_type endpoints =
+            resolver.resolve(server, port, ip::tcp::resolver::address_configured);
+        for (ip::tcp::resolver::results_type::const_iterator it = endpoints.begin();
+             error && it != endpoints.end(); ++it)
+        {
+            stream.lowest_layer().close();
+            stream.lowest_layer().connect(it->endpoint(), error);
+        }
+#else
         ip::tcp::resolver::query query(server.c_str(), port.c_str());
         ip::tcp::resolver::iterator endpoint_iterator = resolver.resolve(query);
         ip::tcp::resolver::iterator end;
-        boost::system::error_code error = asio::error::host_not_found;
         while (error && endpoint_iterator != end)
         {
             stream.lowest_layer().close();
             stream.lowest_layer().connect(*endpoint_iterator++, error);
         }
+#endif
         if (error)
             return false;
         return true;
@@ -712,7 +752,7 @@ class AcceptedConnectionImpl : public AcceptedConnection
 {
 public:
     AcceptedConnectionImpl(
-            asio::io_service& io_service,
+            ioContext& io_service,
             ssl::context &context,
             bool fUseSSL) :
         sslStream(io_service, context),
@@ -876,7 +916,7 @@ void ThreadRPCServer2(void* parg)
 
     const bool fUseSSL = GetBoolArg("-rpcssl");
 
-    asio::io_service io_service;
+    ioContext io_service;
 
     ssl::context context(ssl::context::sslv23);
     if (fUseSSL)
@@ -917,7 +957,7 @@ void ThreadRPCServer2(void* parg)
         acceptor->set_option(boost::asio::ip::v6_only(loopback), v6_only_error);
 
         acceptor->bind(endpoint);
-        acceptor->listen(socket_base::max_connections);
+        acceptor->listen(RPC_LISTEN_BACKLOG);
 
         RPCListen(acceptor, context, fUseSSL);
         // Cancel outstanding listen-requests for this acceptor when shutting down
@@ -943,7 +983,7 @@ void ThreadRPCServer2(void* parg)
             acceptor->open(endpoint.protocol());
             acceptor->set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
             acceptor->bind(endpoint);
-            acceptor->listen(socket_base::max_connections);
+            acceptor->listen(RPC_LISTEN_BACKLOG);
 
             RPCListen(acceptor, context, fUseSSL);
             // Cancel outstanding listen-requests for this acceptor when shutting down
@@ -1195,7 +1235,7 @@ Object CallRPC(const string& strMethod, const Array& params)
 
     // Connect to localhost
     bool fUseSSL = GetBoolArg("-rpcssl");
-    asio::io_service io_service;
+    ioContext io_service;
     ssl::context context(ssl::context::sslv23);
     context.set_options(ssl::context::no_sslv2);
     asio::ssl::stream<asio::ip::tcp::socket> sslStream(io_service, context);
