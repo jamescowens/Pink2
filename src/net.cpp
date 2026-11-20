@@ -1140,6 +1140,9 @@ void ThreadMapPort2(void* parg)
     const char * minissdpdpath = 0;
     struct UPNPDev * devlist = 0;
     char lanaddr[64];
+#if MINIUPNPC_API_VERSION >= 18
+    char wanaddr[64];
+#endif
 
 #ifndef UPNPDISCOVER_SUCCESS
     /* miniupnpc 1.5 */
@@ -1158,7 +1161,12 @@ void ThreadMapPort2(void* parg)
     struct IGDdatas data;
     int r;
 
+#if MINIUPNPC_API_VERSION >= 18
+    // miniupnpc 2.2.8 added the WAN address arguments
+    r = UPNP_GetValidIGD(devlist, &urls, &data, lanaddr, sizeof(lanaddr), wanaddr, sizeof(wanaddr));
+#else
     r = UPNP_GetValidIGD(devlist, &urls, &data, lanaddr, sizeof(lanaddr));
+#endif
     if (r == 1)
     {
         if (fDiscover) {
