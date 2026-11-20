@@ -619,7 +619,7 @@ bool AppInit2(boost::thread_group& threadGroup)
             return false;
     }
 
-    if (filesystem::exists(GetDataDir() / strWalletFileName))
+    if (boost::filesystem::exists(GetDataDir() / strWalletFileName))
     {
         CDBEnv::VerifyResult r = bitdb.Verify(strWalletFileName, CWalletDB::Recover);
         if (r == CDBEnv::RECOVER_OK)
@@ -634,7 +634,7 @@ bool AppInit2(boost::thread_group& threadGroup)
             return InitError(_("wallet.dat corrupt, salvage failed"));
     }
 
-    if (filesystem::exists(GetDataDir() / strStakeDBFileName))
+    if (boost::filesystem::exists(GetDataDir() / strStakeDBFileName))
     {
         CDBEnv::VerifyResult r = bitdb.Verify(strStakeDBFileName, CStakeDB::Recover);
         if (r == CDBEnv::RECOVER_OK)
@@ -977,13 +977,13 @@ bool AppInit2(boost::thread_group& threadGroup)
         exit(0);
     }
 
-    filesystem::path pathBootstrap = GetDataDir() / "bootstrap.dat";
-    if (filesystem::exists(pathBootstrap)) {
+    boost::filesystem::path pathBootstrap = GetDataDir() / "bootstrap.dat";
+    if (boost::filesystem::exists(pathBootstrap)) {
         uiInterface.InitMessage(_("Importing bootstrap blockchain data file."));
 
         FILE *file = fopen(pathBootstrap.string().c_str(), "rb");
         if (file) {
-            filesystem::path pathBootstrapOld = GetDataDir() / "bootstrap.dat.old";
+            boost::filesystem::path pathBootstrapOld = GetDataDir() / "bootstrap.dat.old";
             LoadExternalBlockFile(file);
             RenameOver(pathBootstrap, pathBootstrapOld);
         }
