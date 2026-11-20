@@ -8,11 +8,12 @@
  */
 
 
-#if defined(OPTIMIZED_SALSA) &&  defined(__arm__) && defined(__APCS_32__)
-
+/* Outside the OPTIMIZED_SALSA guard, so the object gets a non-executable stack even when empty */
 #if defined(__linux__) && defined(__ELF__)
 .section .note.GNU-stack,"",%progbits
 #endif
+
+#if defined(OPTIMIZED_SALSA) &&  defined(__arm__) && defined(__APCS_32__)
 
 #if defined(__ARM_ARCH_5E__) || defined(__ARM_ARCH_5TE__) || \
 	defined(__ARM_ARCH_5TEJ__) || defined(__ARM_ARCH_6__) || \
