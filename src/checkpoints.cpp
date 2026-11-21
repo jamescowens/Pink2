@@ -246,7 +246,12 @@ namespace Checkpoints
         assert(mapBlockIndex.count(hashSyncCheckpoint));
         const CBlockIndex* pindexSync = mapBlockIndex[hashSyncCheckpoint];
 
-        if (nHeight > pindexSync->nHeight)
+        // The main chain is a single line through pprev. So when the parent and the
+        // sync-checkpoint are both on it, the walk below can only end at the
+        // sync-checkpoint and the check passes: skip it.
+        AssertLockHeld(cs_main); // IsInMainChain() reads pnext and pindexBest
+        if (nHeight > pindexSync->nHeight &&
+            !(pindexPrev->IsInMainChain() && pindexSync->IsInMainChain()))
         {
             // trace back to same height as sync-checkpoint
             const CBlockIndex* pindex = pindexPrev;
