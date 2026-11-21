@@ -19,11 +19,17 @@ SHA256=12edc0df75bf9abd7f82f821795bcee50f42cb2e5f76a6a281b85732798364ef
 WORK=$(mktemp -d)
 cd "$WORK"
 curl -fsSL --retry 3 -o "$VER.tar.gz" "https://download.oracle.com/berkeley-db/$VER.tar.gz"
-if command -v sha256sum >/dev/null 2>&1; then
-    echo "$SHA256  $VER.tar.gz" | sha256sum -c
+# Compare the digest as a string: macOS 15's BSD sha256sum rejects a -c list on stdin.
+if [ "$(uname)" = Darwin ]; then
+    actual=$(shasum -a 256 "$VER.tar.gz" | awk '{print $1}')
 else
-    echo "$SHA256  $VER.tar.gz" | shasum -a 256 -c
+    actual=$(sha256sum "$VER.tar.gz" | awk '{print $1}')
 fi
+if [ "$actual" != "$SHA256" ]; then
+    echo "$VER.tar.gz: SHA-256 $actual, expected $SHA256" >&2
+    exit 1
+fi
+echo "$VER.tar.gz: SHA-256 OK"
 tar xzf "$VER.tar.gz"
 cd "$VER"
 
