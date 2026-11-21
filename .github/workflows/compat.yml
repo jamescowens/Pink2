@@ -1,0 +1,148 @@
+# Fork-only CI for the compat/modern-toolchains branch. It builds 2.4.0.0 plus
+# the compat fixes with the OLD build system (src/makefile.unix,
+# src/makefile.osx, pinkcoin-qt.pro) on current toolchains, then smoke-tests
+# the RPC server and client. The real CI arrives with the CMake PR, modeled on
+# Gridcoin's cmake_production.yml.
+#
+# What each job covers that the two dev hosts (Leap 16, Intel macOS 14) do not:
+#   ubuntu-22.04  GCC 11, Boost 1.74 (the copy_options cutover), OpenSSL 3.0.2,
+#                 miniupnpc API 17 (the pre-2.2.8 UPNP_GetValidIGD path)
+#   ubuntu-24.04  GCC 13, Boost 1.83, OpenSSL 3.0.13
+#   macos-15      arm64, Apple clang 17, Homebrew Boost 1.92 and OpenSSL 3.6
+# Intel macOS is not here yet: Homebrew has no Intel bottles left for boost,
+# openssl@3 or miniupnpc, so it needs a bottle mirror (as Gridcoin uses) or a
+# source build of each.
+name: compat (legacy build)
+
+on:
+  push:
+    branches: ['compat/**', 'ci/**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config curl \
+            libboost-system-dev libboost-filesystem-dev libboost-program-options-dev \
+            libboost-thread-dev libboost-chrono-dev \
+            libssl-dev libminiupnpc-dev zlib1g-dev \
+            qtbase5-dev qttools5-dev-tools libqt5svg5-dev libqrencode-dev
+
+      - name: Toolchain versions
+        run: |
+          gcc --version | head -1
+          openssl version
+          grep -m1 'define BOOST_LIB_VERSION' /usr/include/boost/version.hpp || true
+          grep -rh -m1 'define MINIUPNPC_API_VERSION' /usr/include/miniupnpc/ || true
+          dpkg-query -W -f='qtbase5-dev ${Version}\n' qtbase5-dev
+
+      - name: Cache Berkeley DB 4.8
+        id: bdb
+        uses: actions/cache@v5
+        with:
+          path: ~/db48
+          key: bdb48-${{ matrix.os }}-${{ hashFiles('.github/scripts/build-bdb48.sh') }}
+
+      - name: Build Berkeley DB 4.8
+        if: steps.bdb.outputs.cache-hit != 'true'
+        run: .github/scripts/build-bdb48.sh "$HOME/db48"
+
+      - name: Build pink2d (makefile.unix)
+        run: |
+          mkdir -p src/obj
+          make -C src -f makefile.unix -j"$(nproc)" USE_UPNP=1 \
+            BDB_INCLUDE_PATH="$HOME/db48/include" BDB_LIB_PATH="$HOME/db48/lib" BDB_LIB_SUFFIX=-4.8 \
+            pink2d
+
+      - name: Build Pinkcoin-Qt (qmake)
+        run: |
+          QMAKE=$(command -v qmake-qt5 || true)
+          for q in /usr/lib/qt5/bin/qmake /usr/lib/x86_64-linux-gnu/qt5/bin/qmake; do
+            [ -n "$QMAKE" ] || { [ -x "$q" ] && QMAKE=$q; }
+          done
+          # pinkcoin-qt.pro names its build.h target by absolute path but the
+          # objects depend on build/build.h, so generate it first.
+          mkdir -p build && sh share/genbuild.sh build/build.h
+          "$QMAKE" pinkcoin-qt.pro USE_UPNP=1 USE_QRCODE=1 \
+            BDB_INCLUDE_PATH="$HOME/db48/include" BDB_LIB_PATH="$HOME/db48/lib"
+          make -j"$(nproc)"
+
+      - name: No executable stack
+        run: |
+          for b in src/pink2d Pinkcoin-Qt; do
+            flags=$(readelf -lW "$b" | awk '$1 == "GNU_STACK" {print $7}')
+            echo "$b GNU_STACK $flags"
+            [ "$flags" = RW ] || { echo "::error::$b has GNU_STACK $flags"; exit 1; }
+          done
+
+      - name: Smoke test
+        run: .github/scripts/smoke.sh src/pink2d ./Pinkcoin-Qt
+
+  macos-arm64:
+    name: macos-15 (arm64, daemon)
+    runs-on: macos-15
+    env:
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packages
+        run: |
+          brew update
+          # The image hand-links a leftover openssl@1.1 at $(brew --prefix)/bin/openssl,
+          # which makes the openssl@3 relink fail (see Gridcoin cmake_production.yml).
+          openssl_link="$(brew --prefix)/bin/openssl"
+          case "$(readlink "$openssl_link" 2>/dev/null)" in
+            */openssl@1.1/bin/openssl) rm -f "$openssl_link" ;;
+          esac
+          brew install boost openssl@3 miniupnpc automake
+
+      - name: Toolchain versions
+        run: |
+          clang --version | head -1
+          brew list --versions boost openssl@3 miniupnpc
+
+      - name: Cache Berkeley DB 4.8
+        id: bdb
+        uses: actions/cache@v5
+        with:
+          path: ~/db48
+          key: bdb48-macos-15-arm64-${{ hashFiles('.github/scripts/build-bdb48.sh') }}
+
+      - name: Build Berkeley DB 4.8
+        if: steps.bdb.outputs.cache-hit != 'true'
+        run: .github/scripts/build-bdb48.sh "$HOME/db48"
+
+      - name: Build pink2d (makefile.osx)
+        run: |
+          P=$(brew --prefix)
+          # CI-only edits to the old makefile: -msse2 is x86-only, and Apple clang
+          # defaults to C++98 (DEBUGFLAGS adds -std=c++11). The GUI is not built:
+          # pinkcoin-qt.pro hardcodes -arch x86_64.
+          sed -i '' 's/ -msse2//' src/makefile.osx
+          cd src && mkdir -p obj
+          make -f makefile.osx -j"$(sysctl -n hw.logicalcpu)" CXX=clang++ DEBUGFLAGS=-std=c++11 \
+            INCLUDEPATHS="-I$PWD -I$PWD/obj -I$P/opt/miniupnpc/include -I$HOME/db48/include -I$P/opt/boost/include -I$P/opt/openssl@3/include" \
+            LIBPATHS="-L$P/opt/miniupnpc/lib -L$HOME/db48/lib -L$P/opt/boost/lib -L$P/opt/openssl@3/lib" \
+            LIBS="-dead_strip -ldb_cxx-4.8 -lboost_filesystem -lboost_program_options -lboost_thread -lboost_chrono -lssl -lcrypto -lz -lminiupnpc leveldb/libleveldb.a leveldb/libmemenv.a"
+          file pink2d
+
+      - name: Smoke test
+        run: .github/scripts/smoke.sh src/pink2d
