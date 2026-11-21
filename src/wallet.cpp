@@ -2487,6 +2487,22 @@ bool CWallet::GetStakeWeight(const CKeyStore& keystore, uint64_t& nMinWeight, ui
     return true;
 }
 
+namespace {
+// Where a staking coin's transaction sits: the block's hash and time and the
+// transaction's offset in it, the kernel inputs that come from the block. They
+// stay the same while that block is on the main chain, so the stake miner keeps
+// them between passes instead of reading the txindex and the block header from
+// disk, under cs_main, for every coin on every pass. Keyed by txid.
+struct StakeTxSource
+{
+    uint256 hashBlock;
+    unsigned int nTimeBlock;
+    unsigned int nTxOffset;
+};
+CCriticalSection cs_mapStakeTxSource;
+map<uint256, StakeTxSource> mapStakeTxSource;
+}
+
 bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int64_t nSearchInterval, int64_t nFees, CTransaction& txNew, CKey& key)
 {
     CBlockIndex* pindexPrev = pindexBest;
@@ -2526,39 +2542,77 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
    // scriptD4L.SetDestination(addrD4L.Get());
     
 
-    CTxDB txdb("r");
+    // Each coin's txid, computed once per pass, in setCoins order (the order
+    // the search has always used).
+    vector<pair<pair<const CWalletTx*, unsigned int>, uint256> > vCoins;
+    vCoins.reserve(setCoins.size());
     BOOST_FOREACH(PAIRTYPE(const CWalletTx*, unsigned int) pcoin, setCoins)
-    {
-        CTxIndex txindex;
-        {
-            LOCK2(cs_main, cs_wallet);
-            if (!txdb.ReadTxIndex(pcoin.first->GetHash(), txindex))
-                continue;
-        }
+        vCoins.push_back(make_pair(pcoin, pcoin.first->GetHash()));
 
-        // Read block header
-        CBlock block;
+    // Keep the cached source of every coin whose block is still on the main
+    // chain, checking them all under one cs_main hold.
+    LOCK(cs_mapStakeTxSource);
+    map<uint256, StakeTxSource> mapSourceNow;
+    {
+        LOCK(cs_main);
+        for (unsigned int i = 0; i < vCoins.size(); i++)
         {
-            LOCK2(cs_main, cs_wallet);
-            if (!block.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
+            map<uint256, StakeTxSource>::const_iterator it = mapStakeTxSource.find(vCoins[i].second);
+            if (it == mapStakeTxSource.end())
                 continue;
+            map<uint256, CBlockIndex*>::const_iterator mi = mapBlockIndex.find(it->second.hashBlock);
+            if (mi != mapBlockIndex.end() && mi->second->IsInMainChain())
+                mapSourceNow.insert(*it);
         }
+    }
+
+    CTxDB txdb("r");
+    for (unsigned int i = 0; i < vCoins.size(); i++)
+    {
+        const pair<const CWalletTx*, unsigned int>& pcoin = vCoins[i].first;
+        const uint256& hashTx = vCoins[i].second;
+
+        map<uint256, StakeTxSource>::iterator itSource = mapSourceNow.find(hashTx);
+        if (itSource == mapSourceNow.end())
+        {
+            CTxIndex txindex;
+            {
+                LOCK2(cs_main, cs_wallet);
+                if (!txdb.ReadTxIndex(hashTx, txindex))
+                    continue;
+            }
+
+            // Read block header
+            CBlock block;
+            {
+                LOCK2(cs_main, cs_wallet);
+                if (!block.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
+                    continue;
+            }
+
+            StakeTxSource source;
+            source.hashBlock = block.GetHash(); // scrypt, so once per coin, not per timestamp tried
+            source.nTimeBlock = block.GetBlockTime();
+            source.nTxOffset = txindex.pos.nTxPos - txindex.pos.nBlockPos;
+            itSource = mapSourceNow.insert(make_pair(hashTx, source)).first;
+        }
+        const StakeTxSource& source = itSource->second;
 
         static int nMaxStakeSearchInterval = 60;
 
         unsigned int nStakeMinAgeCurrent = nStakeMinAge;
 
-        if (block.GetBlockTime() + nStakeMinAgeCurrent > txNew.nTime - nMaxStakeSearchInterval)
+        if ((int64_t)source.nTimeBlock + nStakeMinAgeCurrent > txNew.nTime - nMaxStakeSearchInterval)
             continue; // only count coins meeting min age requirement
-        
+
         bool fKernelFound = false;
+        const COutPoint prevoutStake(hashTx, pcoin.second);
         for (unsigned int n=0; n<min(nSearchInterval,(int64_t)nMaxStakeSearchInterval) && !fKernelFound && !fShutdown && pindexPrev == pindexBest; n++)
         {
-            // Search backward in time from the given txNew timestamp 
+            // Search backward in time from the given txNew timestamp
             // Search nSearchInterval seconds back up to nMaxStakeSearchInterval
             uint256 hashProofOfStake = 0, targetProofOfStake = 0;
-            COutPoint prevoutStake = COutPoint(pcoin.first->GetHash(), pcoin.second);
-            if (CheckStakeKernelHash(nBits, block, txindex.pos.nTxPos - txindex.pos.nBlockPos, *pcoin.first, prevoutStake, txNew.nTime - n, hashProofOfStake, targetProofOfStake))
+            if (CheckStakeKernelHash(nBits, source.hashBlock, source.nTimeBlock, source.nTxOffset, *pcoin.first, prevoutStake, txNew.nTime - n, hashProofOfStake, targetProofOfStake))
             {
                 // Found a kernel
                 if (fDebug && GetBoolArg("-printcoinstake"))
@@ -2639,6 +2693,9 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
         if (fKernelFound || fShutdown)
             break; // if kernel is found stop searching
     }
+
+    // Coins that left the wallet or the main chain drop out of the cache here.
+    mapStakeTxSource.swap(mapSourceNow);
 
     if (nCredit == 0 || nCredit > nBalance - nReserveBalance)
         return false;
