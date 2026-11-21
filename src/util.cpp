@@ -133,10 +133,17 @@ instance_of_cinit;
 
 void RandAddSeed()
 {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    // OpenSSL 3 seeds and reseeds its DRBG from the OS by itself. There RAND_add
+    // forces a full reseed, and ProcessMessage calls this for every P2P message:
+    // about 20 ms each where the seed source is jitterentropy (SUSE's FIPS build).
+    // The performance counter adds nothing worth that, so leave the DRBG alone.
+#else
     // Seed with CPU performance counter
     int64_t nCounter = GetPerformanceCounter();
     RAND_add(&nCounter, sizeof(nCounter), 1.5);
     memset(&nCounter, 0, sizeof(nCounter));
+#endif
 }
 
 void RandAddSeedPerfmon()
