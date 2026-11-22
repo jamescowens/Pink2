@@ -187,10 +187,10 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees)
             if (tx.IsCoinBase() || tx.IsCoinStake() || !tx.IsFinal())
                 continue;
 
-            COrphan* porphan = NULL;
             double dPriority = 0;
             int64_t nTotalIn = 0;
             bool fMissingInputs = false;
+            vector<uint256> vPooledParents; // one entry per input spent from the memory pool
             BOOST_FOREACH(const CTxIn& txin, tx.vin)
             {
                 // Read prev transaction
@@ -198,28 +198,17 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees)
                 CTxIndex txindex;
                 if (!txPrev.ReadFromDisk(txdb, txin.prevout, txindex))
                 {
-                    // This should never happen; all transactions in the memory
-                    // pool should connect to either transactions in the chain
-                    // or other transactions in the memory pool.
+                    // Every input must be in the chain or in the memory pool;
+                    // skip the transaction otherwise.
                     if (!mempool.mapTx.count(txin.prevout.hash))
                     {
                         printf("ERROR: mempool transaction missing input\n");
-                        if (fDebug) assert("mempool transaction missing input" == 0);
                         fMissingInputs = true;
-                        if (porphan)
-                            vOrphan.pop_back();
                         break;
                     }
 
                     // Has to wait for dependencies
-                    if (!porphan)
-                    {
-                        // Use list for automatic deletion
-                        vOrphan.push_back(COrphan(&tx));
-                        porphan = &vOrphan.back();
-                    }
-                    mapDependers[txin.prevout.hash].push_back(porphan);
-                    porphan->setDependsOn.insert(txin.prevout.hash);
+                    vPooledParents.push_back(txin.prevout.hash);
                     nTotalIn += mempool.mapTx[txin.prevout.hash].vout[txin.prevout.n].nValue;
                     continue;
                 }
@@ -230,6 +219,20 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees)
                 dPriority += (double)nValueIn * nConf;
             }
             if (fMissingInputs) continue;
+
+            // Queue entry for a transaction that waits on pooled parents
+            COrphan* porphan = NULL;
+            if (!vPooledParents.empty())
+            {
+                // Use list for automatic deletion
+                vOrphan.push_back(COrphan(&tx));
+                porphan = &vOrphan.back();
+                BOOST_FOREACH(const uint256& hashParent, vPooledParents)
+                {
+                    mapDependers[hashParent].push_back(porphan);
+                    porphan->setDependsOn.insert(hashParent);
+                }
+            }
 
             // Priority is sum(valuein * age) / txsize
             unsigned int nTxSize = ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION);
