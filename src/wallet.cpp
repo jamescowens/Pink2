@@ -1492,6 +1492,71 @@ bool CWallet::SelectCoinsForStaking(int64_t nTargetValue, unsigned int nSpendTim
 }
 
 
+// One walk of mapWallet gives the balance and the staking candidates.  The
+// selection afterwards is the one SelectCoinsForStaking makes, with the target
+// nBalanceRet - nReserveBalance.
+bool CWallet::SelectStakeCandidates(unsigned int nSpendTime, StakeCoins& vCoinsRet, int64_t& nBalanceRet) const
+{
+    vCoinsRet.clear();
+    nBalanceRet = 0;
+
+    StakeCoins vAvailable;
+    {
+        LOCK2(cs_main, cs_wallet);
+        for (map<uint256, CWalletTx>::const_iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
+        {
+            const CWalletTx* pcoin = &(*it).second;
+
+            // Same as GetBalance()
+            if (pcoin->IsTrusted())
+                nBalanceRet += pcoin->GetAvailableCredit();
+
+            // Same filters as AvailableCoinsForStaking()
+            if (pcoin->nTime + nStakeMinAge > nSpendTime)
+                continue;
+
+            if (pcoin->GetBlocksToMaturity() > 0)
+                continue;
+
+            if (pcoin->GetDepthInMainChain() < 1)
+                continue;
+
+            for (unsigned int i = 0; i < pcoin->vout.size(); i++)
+                if (!(pcoin->IsSpent(i)) && IsMine(pcoin->vout[i]) && pcoin->vout[i].nValue >= 0)
+                    vAvailable.push_back(CStakeCoin((*it).first, pcoin, i));
+        }
+    }
+
+    if (nBalanceRet <= nReserveBalance)
+        return false;
+
+    int64_t nTargetValue = nBalanceRet - nReserveBalance;
+    int64_t nValueRet = 0;
+
+    // Same selection loop as SelectCoinsForStaking()
+    BOOST_FOREACH(const CStakeCoin& coin, vAvailable)
+    {
+        if (nValueRet >= nTargetValue)
+            break;
+
+        int64_t n = coin.pwtx->vout[coin.nOut].nValue;
+
+        if (n >= nTargetValue)
+        {
+            vCoinsRet.push_back(coin);
+            nValueRet += n;
+            break;
+        }
+        else if (n < nTargetValue + CENT)
+        {
+            vCoinsRet.push_back(coin);
+            nValueRet += n;
+        }
+    }
+
+    return !vCoinsRet.empty();
+}
+
 bool CWallet::CreateTransaction(const vector<pair<CScript, int64_t> >& vecSend, CWalletTx& wtxNew, CReserveKey& reservekey, int64_t& nFeeRet, int32_t& nChangePos, int nSplitBlock, const CCoinControl* coinControl)
 {
     int64_t nValue = 0;
