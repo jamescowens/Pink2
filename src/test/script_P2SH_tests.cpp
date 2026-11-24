@@ -13,8 +13,6 @@ using namespace std;
 
 // Test routines internal to script.cpp:
 extern uint256 SignatureHash(CScript scriptCode, const CTransaction& txTo, unsigned int nIn, int nHashType);
-extern bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CTransaction& txTo, unsigned int nIn,
-                         bool fValidatePayToScriptHash, int nHashType);
 
 // Helpers:
 static std::vector<unsigned char>
@@ -40,9 +38,11 @@ Verify(const CScript& scriptSig, const CScript& scriptPubKey, bool fStrict)
     txTo.vin[0].scriptSig = scriptSig;
     txTo.vout[0].nValue = 1;
 
-    return VerifyScript(scriptSig, scriptPubKey, txTo, 0, fStrict, 0);
+    return VerifyScript(scriptSig, scriptPubKey, txTo, 0, 0);
 }
 
+
+extern bool CastToBool(const vector<unsigned char>& vch);
 
 BOOST_AUTO_TEST_SUITE(script_P2SH_tests)
 
@@ -105,7 +105,7 @@ BOOST_AUTO_TEST_CASE(sign)
         {
             CScript sigSave = txTo[i].vin[0].scriptSig;
             txTo[i].vin[0].scriptSig = txTo[j].vin[0].scriptSig;
-            bool sigOK = VerifySignature(txFrom, txTo[i], 0, true, 0);
+            bool sigOK = VerifySignature(txFrom, txTo[i], 0, 0);
             if (i == j)
                 BOOST_CHECK_MESSAGE(sigOK, strprintf("VerifySignature %d %d", i, j));
             else
@@ -235,9 +235,12 @@ BOOST_AUTO_TEST_CASE(switchover)
     fund.SetDestination(notValid.GetID());
 
 
-    // Validation should succeed under old rules (hash is correct):
-    BOOST_CHECK(Verify(scriptSig, fund, false));
-    // Fail under new:
+    // The outer script alone succeeds (the hash is correct):
+    vector<vector<unsigned char> > stack;
+    BOOST_CHECK(EvalScript(stack, scriptSig, CTransaction(), 0, 0));
+    BOOST_CHECK(EvalScript(stack, fund, CTransaction(), 0, 0));
+    BOOST_CHECK(!stack.empty() && CastToBool(stack.back()));
+    // Pink2 always validates pay-to-script-hash, so the serialized script is run too, and fails:
     BOOST_CHECK(!Verify(scriptSig, fund, true));
 }
 
