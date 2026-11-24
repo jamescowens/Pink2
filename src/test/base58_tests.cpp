@@ -76,6 +76,10 @@ public:
     {
         return (exp_addrType == "none");
     }
+    bool operator()(const CStealthAddress &sxAddr) const
+    {
+        return false;
+    }
 };
 
 // Visitor to check address payload
@@ -98,6 +102,10 @@ public:
     bool operator()(const CNoDestination &no) const
     {
         return exp_payload.size() == 0;
+    }
+    bool operator()(const CStealthAddress &sxAddr) const
+    {
+        return false;
     }
 };
 
