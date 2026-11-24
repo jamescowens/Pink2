@@ -1,7 +1,8 @@
 # Fork-only CI for the compat/modern-toolchains branch. It builds 2.4.0.0 plus
 # the compat fixes with the OLD build system (src/makefile.unix,
 # src/makefile.osx, pinkcoin-qt.pro) on current toolchains, then smoke-tests
-# the RPC server and client. The real CI arrives with the CMake PR, modeled on
+# the RPC server and client. On Linux it also builds and runs the unit tests
+# (makefile.unix test_pink2). The real CI arrives with the CMake PR, modeled on
 # Gridcoin's cmake_production.yml.
 #
 # What each job covers that the two dev hosts (Leap 16, Intel macOS 14) do not:
@@ -41,7 +42,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config curl \
             libboost-system-dev libboost-filesystem-dev libboost-program-options-dev \
-            libboost-thread-dev libboost-chrono-dev \
+            libboost-thread-dev libboost-chrono-dev libboost-test-dev \
             libssl-dev libminiupnpc-dev zlib1g-dev \
             qtbase5-dev qttools5-dev-tools libqt5svg5-dev libqrencode-dev
 
@@ -94,6 +95,19 @@ jobs:
 
       - name: Smoke test
         run: .github/scripts/smoke.sh src/pink2d ./Pinkcoin-Qt
+
+      - name: Unit tests (makefile.unix test_pink2)
+        run: |
+          set -o pipefail
+          make -C src -f makefile.unix -j"$(nproc)" USE_UPNP=1 \
+            BDB_INCLUDE_PATH="$HOME/db48/include" BDB_LIB_PATH="$HOME/db48/lib" BDB_LIB_SUFFIX=-4.8 \
+            test_pink2
+          # Boost.Test writes its report to stderr
+          (cd src && ./test_pink2 --report_level=short 2>&1) | tee test_pink2.log
+          # Guard against a run that passes because most cases were skipped
+          passed=$(grep -oE '[0-9]+ test cases? out of [0-9]+ passed' test_pink2.log | head -1 | cut -d' ' -f1 || true)
+          echo "passed: ${passed:-0}"
+          [ "${passed:-0}" -ge 70 ] || { echo "::error::only ${passed:-0} unit test cases passed (expected at least 70)"; exit 1; }
 
   macos-arm64:
     name: macos-15 (arm64, daemon)
