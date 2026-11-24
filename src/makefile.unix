@@ -185,10 +185,30 @@ obj/%.o: %.cpp
 pink2d: $(OBJS:obj/%=obj/%)
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
 
+# Unit tests: make -f makefile.unix test_pink2, then ./test_pink2
+TESTDEFS = -DTEST_DATA_DIR=$(abspath test/data)
+ifeq (${LMODE}, dynamic)
+    TESTDEFS += -DBOOST_TEST_DYN_LINK
+endif
+TESTLIBS = -Wl,-B$(LMODE) -l boost_unit_test_framework$(BOOST_LIB_SUFFIX) -Wl,-Bdynamic
+TESTOBJS := $(patsubst test/%.cpp,obj-test/%.o,$(sort $(wildcard test/*.cpp)))
+
+-include obj-test/*.P
+
+obj-test/%.o: test/%.cpp
+	$(CXX) -c $(TESTDEFS) $(xCXXFLAGS) -MMD -MF $(@:%.o=%.d) -o $@ $<
+	@cp $(@:%.o=%.d) $(@:%.o=%.P); \
+		sed -e 's/#.*//' -e 's/^[^:]*: *//' -e 's/ *\\$$//' \
+		-e '/^$$/ d' -e 's/$$/ :/' < $(@:%.o=%.d) >> $(@:%.o=%.P); \
+	rm -f $(@:%.o=%.d)
+
+test_pink2: $(TESTOBJS) $(filter-out obj/init.o,$(OBJS:obj/%=obj/%))
+	$(LINK) $(xCXXFLAGS) -o $@ $^ $(TESTLIBS) $(xLDFLAGS) $(LIBS)
+
 clean:
-	-rm -f pink2d
-	-rm -f obj/*.o
-	-rm -f obj/*.P
+	-rm -f pink2d test_pink2
+	-rm -f obj/*.o obj-test/*.o
+	-rm -f obj/*.P obj-test/*.P
 	-rm -f obj/build.h
 
 FORCE:
