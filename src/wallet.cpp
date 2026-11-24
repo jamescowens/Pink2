@@ -2792,6 +2792,159 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
     return true;
 }
 
+bool IsStakeCoinCurrent(const CWallet& wallet, const uint256& hashTx, const CWalletTx* pwtx)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    map<uint256, CWalletTx>::const_iterator it = wallet.mapWallet.find(hashTx);
+    return it != wallet.mapWallet.end() && &(*it).second == pwtx;
+}
+
+bool IsStakeCoinUsable(const CWallet& wallet, const uint256& hashTx, const CWalletTx* pwtx, unsigned int nOut)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    return IsStakeCoinCurrent(wallet, hashTx, pwtx) && !pwtx->IsSpent(nOut);
+}
+
+bool CWallet::BeginCoinStake(const CStakeKernel& kernel, const StakeCoins& vCoins, int64_t nBalance, CTransaction& txNew, std::vector<const CWalletTx*>& vwtxPrev, int64_t& nCreditRet)
+{
+    AssertLockHeld(cs_main);
+    LOCK(cs_wallet);
+
+    txNew.vin.clear();
+    txNew.vout.clear();
+    vwtxPrev.clear();
+    nCreditRet = 0;
+
+    // Mark coin stake transaction
+    CScript scriptEmpty;
+    scriptEmpty.clear();
+    txNew.vout.push_back(CTxOut(0, scriptEmpty));
+
+    // The coinstake has the kernel's time
+    txNew.nTime = kernel.nTime;
+
+    // The kernel input, and its output paying to the kernel's public key
+    int64_t nCredit = 0;
+    txNew.vin.push_back(CTxIn(kernel.hashTx, kernel.nOut));
+    nCredit += kernel.pwtx->vout[kernel.nOut].nValue;
+    vwtxPrev.push_back(kernel.pwtx);
+    txNew.vout.push_back(CTxOut(0, kernel.scriptPubKeyOut));
+
+    // Split the stake into two outputs when the kernel's value plus its reward is over the split threshold
+    uint64_t nCoinAge;
+    CTxDB txdb("r");
+    if (txNew.GetCoinAge(txdb, nCoinAge))
+    {
+        int64_t nTotalSize = kernel.pwtx->vout[kernel.nOut].nValue + GetProofOfStakeReward(nCoinAge, 0, pindexBest->nHeight + 1, txNew.nTime);
+        if (nTotalSize > nSplitThreshold * COIN)
+            txNew.vout.push_back(CTxOut(0, kernel.scriptPubKeyOut)); //split stake
+    }
+
+    if (nCredit == 0 || nCredit > nBalance - nReserveBalance)
+        return false;
+
+    // The coins in CreateCoinStake's order: its set of (transaction, output) pairs,
+    // each with its transaction's id. A coin the wallet no longer holds is left out;
+    // a staking coin must still be unspent in the wallet.
+    typedef std::pair<const CWalletTx*, unsigned int> StakeCoinKey;
+    std::map<StakeCoinKey, uint256> mapCoins;
+    BOOST_FOREACH(const CStakeCoin& coin, vCoins)
+        if (IsStakeCoinUsable(*this, coin.hashTx, coin.pwtx, coin.nOut))
+            mapCoins.insert(std::make_pair(StakeCoinKey(coin.pwtx, coin.nOut), coin.hashTx));
+
+    // The weight of a combined input is taken at the coinstake's time and Flash class
+    const bool fFlashStake = (pindexBest->nTime > nTimeV231) && IsFlashStake(txNew.nTime);
+
+    for (std::map<StakeCoinKey, uint256>::const_iterator it = mapCoins.begin(); it != mapCoins.end(); ++it)
+    {
+        const StakeCoinKey& pcoin = (*it).first;
+        const uint256& hashCoinTx = (*it).second;
+        // Attempt to add more inputs
+        // Only add coins of the same key/address as kernel
+        if (txNew.vout.size() == 2 && ((pcoin.first->vout[pcoin.second].scriptPubKey == kernel.scriptPubKeyKernel || pcoin.first->vout[pcoin.second].scriptPubKey == txNew.vout[1].scriptPubKey))
+            && hashCoinTx != txNew.vin[0].prevout.hash)
+        {
+            int64_t nTimeWeight = GetWeight((int64_t)pcoin.first->nTime, (int64_t)txNew.nTime, fFlashStake);
+
+            // Stop adding more inputs if already too many inputs
+            if (txNew.vin.size() >= 100)
+                break;
+            // Stop adding more inputs if value is already pretty significant
+            if (nCredit >= (nCombineThreshold * COIN))
+                break;
+            // Stop adding inputs if reached reserve limit
+            if (nCredit + pcoin.first->vout[pcoin.second].nValue > nBalance - nReserveBalance)
+                break;
+            // Do not add additional significant input
+            if (pcoin.first->vout[pcoin.second].nValue >= (nCombineThreshold * COIN))
+                continue;
+            // Do not add input that is still too young
+            unsigned int nStakeMinAgeCurrent = nStakeMinAge;
+
+            if (nTimeWeight < nStakeMinAgeCurrent)
+                continue;
+
+            txNew.vin.push_back(CTxIn(hashCoinTx, pcoin.second));
+            nCredit += pcoin.first->vout[pcoin.second].nValue;
+            vwtxPrev.push_back(pcoin.first);
+        }
+    }
+
+    nCreditRet = nCredit;
+    return true;
+}
+
+bool CWallet::FinishCoinStake(int64_t nFees, int64_t nCredit, const std::vector<const CWalletTx*>& vwtxPrev, int nHeight, CTransaction& txNew)
+{
+    AssertLockHeld(cs_main);
+    LOCK(cs_wallet);
+
+    // Calculate coin age reward
+
+    int64_t nReward;
+    {
+        uint64_t nCoinAge;
+        CTxDB txdb("r");
+        if (!txNew.GetCoinAge(txdb, nCoinAge))
+            return error("FinishCoinStake : failed to calculate coin age");
+
+        nReward = GetProofOfStakeReward(nCoinAge, nFees, nHeight, txNew.nTime);
+        if (nReward <= 0 && nHeight - 1 > 16240)
+            return false;
+    }
+
+    int64_t stakeOutCount = CountStakeOut();
+    int64_t stakeOutReward =  AggregateStakeOut(txNew, nReward);
+
+    nCredit += nReward - stakeOutReward;
+    // Set output amount
+    if (txNew.vout.size() == (uint64_t)(3 + stakeOutCount))
+    {
+        txNew.vout[1].nValue = ((nCredit) / 2 / CENT) * CENT;
+        txNew.vout[2].nValue = (nCredit) - txNew.vout[1].nValue;
+
+    }
+    else {
+        txNew.vout[1].nValue = nCredit;
+    }
+
+
+    // Sign
+    int nIn = 0;
+    BOOST_FOREACH(const CWalletTx* pcoin, vwtxPrev)
+    {
+        if (!SignSignature(*this, *pcoin, txNew, nIn++))
+            return error("FinishCoinStake : failed to sign coinstake");
+    }
+
+    // Limit size
+    unsigned int nBytes = ::GetSerializeSize(txNew, SER_NETWORK, PROTOCOL_VERSION);
+    if (nBytes >= MAX_BLOCK_SIZE_GEN/5)
+        return error("FinishCoinStake : exceeded coinstake size limit");
+
+    return true;
+}
+
 int64_t CWallet::AggregateStakeOut(CTransaction &txNew, int64_t &nReward)
 {
     double percentTotal = 0;
