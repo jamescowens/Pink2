@@ -84,6 +84,32 @@ struct CStakeCoin
 /** Staking inputs in selection order. */
 typedef std::vector<CStakeCoin> StakeCoins;
 
+/** A stake kernel: the coin (as in CStakeCoin), the second its kernel meets the
+ * target, the key that signs for it, the coin's script and the script the coinstake
+ * pays to (pay to public key; a pay-to-address kernel is converted to it). */
+struct CStakeKernel
+{
+    uint256 hashTx;
+    const CWalletTx* pwtx;
+    unsigned int nOut;
+    unsigned int nTime;
+    CKey key;
+    CScript scriptPubKeyKernel;
+    CScript scriptPubKeyOut;
+
+    CStakeKernel() : pwtx(NULL), nOut(0), nTime(0) {}
+};
+
+/** Whether the wallet still holds a staking coin: mapWallet maps hashTx to the
+ * entry pwtx. A pass uses a staking coin only while the wallet still holds it.
+ * Requires wallet.cs_wallet. */
+bool IsStakeCoinCurrent(const CWallet& wallet, const uint256& hashTx, const CWalletTx* pwtx);
+
+/** Whether a staking coin can be used: the wallet still holds it (IsStakeCoinCurrent)
+ * and output nOut of pwtx is unspent in the wallet. A staking coin must still be
+ * unspent in the wallet. Requires wallet.cs_wallet. */
+bool IsStakeCoinUsable(const CWallet& wallet, const uint256& hashTx, const CWalletTx* pwtx, unsigned int nOut);
+
 /** A CWallet is an extension of a keystore, which also maintains a set of transactions and balances,
  * and provides the ability to create new transactions.
  */
@@ -235,6 +261,19 @@ public:
 
     bool GetStakeWeight(const CKeyStore& keystore, uint64_t& nMinWeight, uint64_t& nMaxWeight, uint64_t& nWeight);
     bool CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int64_t nSearchInterval, int64_t nFees, CTransaction& txNew, CKey& key);
+    /** The coinstake for a found kernel, at the kernel's time, without its output
+     * values: the kernel input and output, the split, the credit check and the
+     * combined inputs, chosen from vCoins as CreateCoinStake chooses them from its
+     * coins; a coin that is not usable (IsStakeCoinUsable) is not combined. Requires
+     * cs_main and cs_wallet, with pindexBest the parent of the block and the kernel's
+     * coin usable (IsStakeCoinUsable). */
+    bool BeginCoinStake(const CStakeKernel& kernel, const StakeCoins& vCoins, int64_t nBalance, CTransaction& txNew, std::vector<const CWalletTx*>& vwtxPrev, int64_t& nCreditRet);
+    /** Complete a coinstake from BeginCoinStake for a block at nHeight whose other
+     * transactions pay nFees: the reward, stake-out, the output values, the
+     * signatures and the size limit, as CreateCoinStake completes it.
+     * BeginCoinStake applies the credit limit. Requires cs_main, with pindexBest
+     * the parent of the block. */
+    bool FinishCoinStake(int64_t nFees, int64_t nCredit, const std::vector<const CWalletTx*>& vwtxPrev, int nHeight, CTransaction& txNew);
     int64_t AggregateStakeOut(CTransaction &txNew, int64_t &nReward);
     int64_t CountStakeOut();
 
