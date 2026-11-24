@@ -23,6 +23,30 @@ static const unsigned int STAKE_SEARCH_CHUNK = 256;      // coins per hold of cs
    Returns false when the window is empty. */
 bool GetStakeSearchWindow(int64_t nPastLimit, int64_t nPrevBlockTime, int64_t nLastSearched, int64_t nNow, int64_t& nFirstRet, int64_t& nLastRet);
 
+/* The stake miner's start latch, kept by the stake thread between passes. */
+struct CStakeGateState
+{
+    bool fStarted;      // staking has started
+    int64_t nOpenAt;    // before the start: when the settle time ends, or 0 if it has not begun
+
+    CStakeGateState() : fStarted(false), nOpenAt(0) {}
+};
+
+/* The number of connected peers needed to start staking: -minstakepeers, default
+   MIN_PEERS. A value below 1 gives 1. */
+unsigned int GetMinStakePeers();
+
+/* Whether a stake pass may run at nNow. fOpenedRet is true only on the call that starts
+   staking.
+   - Wallet locked: false; the latch is kept.
+   - No peers, or initial download: false; the latch is reset.
+   - Not started: the settle time begins on a call with at least nMinPeers peers (any
+     number on testnet), and ends STAKE_SETTLE_SECONDS later; staking starts on the
+     first call at or after its end. A call with fewer peers ends the settle time, and
+     it begins again.
+   - Started: true. */
+bool CheckStakeGate(CStakeGateState& state, bool fLocked, size_t nPeers, unsigned int nMinPeers, bool fIBD, bool fTestNet, int64_t nNow, bool& fOpenedRet);
+
 /* Where a staking coin's transaction sits: the hash and time of the block that holds
    it and the transaction's offset in that block. */
 struct CStakeTxSource
@@ -74,10 +98,12 @@ bool FindStakeKernel(const StakeCoins& vCoins, const CStakeTxSourceCache& cache,
    transactions chosen for that time and height (none spending a coinstake input),
    the reward with the fees of those transactions, the coinstake signatures and the
    block signature by the kernel key. vCoins and nBalance come from the same
-   SelectStakeCandidates call as the kernel. Requires cs_main and wallet.cs_wallet,
-   with pindexBest == pindexPrev. Returns false if any step fails, or if the
-   kernel's coin is not usable (IsStakeCoinUsable). */
-bool BuildStakeBlock(CWallet& wallet, const CStakeKernel& kernel, const StakeCoins& vCoins, int64_t nBalance, CBlockIndex* pindexPrev, unsigned int nBits, CBlock& blockRet);
+   SelectStakeCandidates call as the kernel. Requires cs_main and wallet.cs_wallet.
+   Returns false if any step fails, with strFailRet naming it: "tip moved"
+   (pindexBest is not pindexPrev), "coin" (the kernel's coin is not usable,
+   IsStakeCoinUsable), "credit check" (BeginCoinStake), "coinstake"
+   (FinishCoinStake) or "sign" (the block signature). */
+bool BuildStakeBlock(CWallet& wallet, const CStakeKernel& kernel, const StakeCoins& vCoins, int64_t nBalance, CBlockIndex* pindexPrev, unsigned int nBits, CBlock& blockRet, std::string& strFailRet);
 
 /* Append memory pool transactions to a block template; returns the fees they pay.
    A transaction is skipped if it is timed after nTxTimeLimit, is not final at
