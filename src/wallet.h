@@ -70,6 +70,20 @@ public:
     )
 };
 
+/** A staking input: the transaction's id (its key in mapWallet), the transaction
+ * and the output index. */
+struct CStakeCoin
+{
+    uint256 hashTx;
+    const CWalletTx* pwtx;
+    unsigned int nOut;
+
+    CStakeCoin(const uint256& hashTxIn, const CWalletTx* pwtxIn, unsigned int nOutIn) : hashTx(hashTxIn), pwtx(pwtxIn), nOut(nOutIn) {}
+};
+
+/** Staking inputs in selection order. */
+typedef std::vector<CStakeCoin> StakeCoins;
+
 /** A CWallet is an extension of a keystore, which also maintains a set of transactions and balances,
  * and provides the ability to create new transactions.
  */
@@ -155,6 +169,7 @@ public:
     bool CanSupportFeature(enum WalletFeature wf) { AssertLockHeld(cs_wallet); return nWalletMaxVersion >= wf; }
 
     void AvailableCoinsForStaking(std::vector<COutput>& vCoins, unsigned int nSpendTime) const;
+    bool SelectStakeCandidates(unsigned int nSpendTime, StakeCoins& vCoinsRet, int64_t& nBalanceRet) const;
     void AvailableCoins(std::vector<COutput>& vCoins, bool fOnlyConfirmed=true, const CCoinControl *coinControl=NULL) const;
     bool SelectCoinsMinConf(int64_t nTargetValue, unsigned int nSpendTime, int nConfMine, int nConfTheirs, std::vector<COutput> vCoins, std::set<std::pair<const CWalletTx*,unsigned int> >& setCoinsRet, int64_t& nValueRet) const;
 
