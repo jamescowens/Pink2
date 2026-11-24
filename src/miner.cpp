@@ -99,45 +99,9 @@ public:
     }
 };
 
-// CreateNewBlock: create new block (without proof-of-work/proof-of-stake)
-CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees)
+// AddPoolTransactions: append memory pool transactions to pblock, in priority order
+int64_t AddPoolTransactions(CBlock* pblock, CBlockIndex* pindexPrev, int64_t nTxTimeLimit, int nFinalHeight, int64_t nFinalTime, const std::set<COutPoint>& setExcluded)
 {
-    // Create new block
-    unique_ptr<CBlock> pblock(new CBlock());
-    if (!pblock.get())
-        return NULL;
-
-    CBlockIndex* pindexPrev = pindexBest;
-
-    // Create coinbase tx
-    CTransaction txNew;
-    txNew.vin.resize(1);
-    txNew.vin[0].prevout.SetNull();
-    txNew.vout.resize(1);
-    
-    
-    int nHeight = pindexPrev->nHeight+1; // height of new block
-
-    if (!fProofOfStake)
-    {
-        CReserveKey reservekey(pwallet);
-        CPubKey pubkey;
-        if (!reservekey.GetReservedKey(pubkey))
-            return NULL;
-        txNew.vout[0].scriptPubKey.SetDestination(pubkey.GetID());
-    }
-    else
-    {
-        // Height first in coinbase required for block.version=2
-        txNew.vin[0].scriptSig = (CScript() << nHeight) + COINBASE_FLAGS;
-        assert(txNew.vin[0].scriptSig.size() <= 100);
-
-        txNew.vout[0].SetEmpty();
-    }
-
-    // Add our coinbase tx as first transaction
-    pblock->vtx.push_back(txNew);
-
     // Largest block you're willing to create:
     unsigned int nBlockMaxSize = GetArg("-blockmaxsize", MAX_BLOCK_SIZE_GEN/2);
     // Limit to betweeen 1K and MAX_BLOCK_SIZE-1K for sanity:
@@ -162,13 +126,6 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees)
     if (mapArgs.count("-mintxfee"))
         ParseMoney(mapArgs["-mintxfee"], nMinTxFee);
 
-    time_t rawtime;
-
-    time ( &rawtime );
-
-    pblock->nBits = GetNextTargetRequired(pindexPrev, fProofOfStake, rawtime);
-
-    // Collect memory pool transactions into the block
     int64_t nFees = 0;
     {
         LOCK2(cs_main, mempool.cs);
@@ -184,7 +141,20 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees)
         for (map<uint256, CTransaction>::iterator mi = mempool.mapTx.begin(); mi != mempool.mapTx.end(); ++mi)
         {
             CTransaction& tx = (*mi).second;
-            if (tx.IsCoinBase() || tx.IsCoinStake() || !tx.IsFinal())
+            if (tx.IsCoinBase() || tx.IsCoinStake() || !tx.IsFinal(nFinalHeight, nFinalTime))
+                continue;
+
+            // Skip a transaction that spends one of the excluded outputs
+            bool fSpendsExcluded = false;
+            BOOST_FOREACH(const CTxIn& txinCheck, tx.vin)
+            {
+                if (setExcluded.count(txinCheck.prevout))
+                {
+                    fSpendsExcluded = true;
+                    break;
+                }
+            }
+            if (fSpendsExcluded)
                 continue;
 
             double dPriority = 0;
@@ -283,7 +253,7 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees)
                 continue;
 
             // Timestamp limit
-            if (tx.nTime > GetAdjustedTime() || (fProofOfStake && tx.nTime > pblock->vtx[0].nTime))
+            if ((int64_t)tx.nTime > nTxTimeLimit)
                 continue;
 
             // Transaction fee
@@ -360,7 +330,66 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees)
         nLastBlockSize = nBlockSize;
 
         if (fDebug && GetBoolArg("-printpriority"))
-            printf("CreateNewBlock(): total size %" PRIu64"\n", nBlockSize);
+            printf("AddPoolTransactions(): total size %" PRIu64"\n", nBlockSize);
+    }
+
+    return nFees;
+}
+
+// CreateNewBlock: create new block (without proof-of-work/proof-of-stake)
+CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees)
+{
+    // Create new block
+    unique_ptr<CBlock> pblock(new CBlock());
+    if (!pblock.get())
+        return NULL;
+
+    CBlockIndex* pindexPrev = pindexBest;
+
+    // Create coinbase tx
+    CTransaction txNew;
+    txNew.vin.resize(1);
+    txNew.vin[0].prevout.SetNull();
+    txNew.vout.resize(1);
+    
+    
+    int nHeight = pindexPrev->nHeight+1; // height of new block
+
+    if (!fProofOfStake)
+    {
+        CReserveKey reservekey(pwallet);
+        CPubKey pubkey;
+        if (!reservekey.GetReservedKey(pubkey))
+            return NULL;
+        txNew.vout[0].scriptPubKey.SetDestination(pubkey.GetID());
+    }
+    else
+    {
+        // Height first in coinbase required for block.version=2
+        txNew.vin[0].scriptSig = (CScript() << nHeight) + COINBASE_FLAGS;
+        assert(txNew.vin[0].scriptSig.size() <= 100);
+
+        txNew.vout[0].SetEmpty();
+    }
+
+    // Add our coinbase tx as first transaction
+    pblock->vtx.push_back(txNew);
+
+    time_t rawtime;
+
+    time ( &rawtime );
+
+    pblock->nBits = GetNextTargetRequired(pindexPrev, fProofOfStake, rawtime);
+
+    // Collect memory pool transactions into the block
+    int64_t nFees = 0;
+    {
+        LOCK2(cs_main, mempool.cs);
+
+        int64_t nTxTimeLimit = GetAdjustedTime();
+        if (fProofOfStake)
+            nTxTimeLimit = min(nTxTimeLimit, (int64_t)pblock->vtx[0].nTime);
+        nFees = AddPoolTransactions(pblock.get(), pindexPrev, nTxTimeLimit, 0, 0, std::set<COutPoint>());
 
         if (!fProofOfStake)
             pblock->vtx[0].vout[0].nValue = GetProofOfWorkReward(nHeight, nFees);

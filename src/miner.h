@@ -9,6 +9,11 @@
 #include "main.h"
 #include "wallet.h"
 
+/* Append memory pool transactions to a block template; returns the fees they pay.
+   A transaction is skipped if it is timed after nTxTimeLimit, is not final at
+   (nFinalHeight, nFinalTime) (0, 0 keeps IsFinal's defaults) or spends an output in setExcluded. */
+int64_t AddPoolTransactions(CBlock* pblock, CBlockIndex* pindexPrev, int64_t nTxTimeLimit, int nFinalHeight, int64_t nFinalTime, const std::set<COutPoint>& setExcluded);
+
 /* Generate a new block, without valid proof-of-work */
 CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake=false, int64_t* pFees = 0);
 
