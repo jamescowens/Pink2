@@ -110,7 +110,8 @@ public:
 };
 
 // Goal: check that parsed keys match test payload
-BOOST_AUTO_TEST_CASE(base58_keys_valid_parse)
+// Disabled until it has Pink2 test vectors: it uses Bitcoin address and key prefixes
+BOOST_AUTO_TEST_CASE(base58_keys_valid_parse, * boost::unit_test::disabled())
 {
     Array tests = read_json("base58_keys_valid.json");
     std::vector<unsigned char> result;
@@ -170,7 +171,8 @@ BOOST_AUTO_TEST_CASE(base58_keys_valid_parse)
 }
 
 // Goal: check that generated keys match test vectors
-BOOST_AUTO_TEST_CASE(base58_keys_valid_gen)
+// Disabled until it has Pink2 test vectors: it uses Bitcoin address and key prefixes
+BOOST_AUTO_TEST_CASE(base58_keys_valid_gen, * boost::unit_test::disabled())
 {
     Array tests = read_json("base58_keys_valid.json");
     std::vector<unsigned char> result;
