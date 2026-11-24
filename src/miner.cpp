@@ -769,9 +769,7 @@ static void StakeMinerPass(CWallet* pwallet, CStakeTxSourceCache& cache, int64_t
             if (BuildStakeBlock(*pwallet, kernel, vCoins, nBalance, pindexPrev, nBits, block, strBuildFail))
             {
                 fBuilt = true;
-                SetThreadPriority(THREAD_PRIORITY_NORMAL);
                 CheckStake(&block, *pwallet);
-                SetThreadPriority(THREAD_PRIORITY_LOWEST);
             }
             nBuildMicros = GetTimeMicros() - nStart;
         }
@@ -790,8 +788,6 @@ static void StakeMinerPass(CWallet* pwallet, CStakeTxSourceCache& cache, int64_t
 
 void StakeMiner(CWallet *pwallet)
 {
-    SetThreadPriority(THREAD_PRIORITY_LOWEST);
-
     // Make this thread recognisable as the mining thread
     RenameThread("pinkcoin-miner");
 
