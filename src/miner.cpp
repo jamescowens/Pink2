@@ -8,6 +8,8 @@
 #include "miner.h"
 #include "kernel.h"
 
+#include <limits>
+
 using namespace std;
 
 bool GetStakeSearchWindow(int64_t nPastLimit, int64_t nPrevBlockTime, int64_t nLastSearched, int64_t nNow, int64_t& nFirstRet, int64_t& nLastRet)
@@ -26,6 +28,41 @@ bool GetStakeSearchWindow(int64_t nPastLimit, int64_t nPrevBlockTime, int64_t nL
         nFirst = max(nFirst, nNow - nNow % 3600);
     nFirstRet = nFirst;
     return nFirst <= nLastRet;
+}
+
+unsigned int GetMinStakePeers()
+{
+    const int64_t nPeers = GetArg("-minstakepeers", MIN_PEERS);
+    if (nPeers < 1)
+        return 1;
+    return (unsigned int)min(nPeers, (int64_t)std::numeric_limits<unsigned int>::max());
+}
+
+bool CheckStakeGate(CStakeGateState& state, bool fLocked, size_t nPeers, unsigned int nMinPeers, bool fIBD, bool fTestNet, int64_t nNow, bool& fOpenedRet)
+{
+    fOpenedRet = false;
+    if (fLocked)
+        return false;
+    if (nPeers == 0 || fIBD)
+    {
+        state.fStarted = false;
+        state.nOpenAt = 0;
+        return false;
+    }
+    if (state.fStarted)
+        return true;
+    if (nPeers < nMinPeers && !fTestNet)
+    {
+        state.nOpenAt = 0;
+        return false;
+    }
+    if (state.nOpenAt == 0)
+        state.nOpenAt = nNow + STAKE_SETTLE_SECONDS;
+    if (nNow < state.nOpenAt)
+        return false;
+    state.fStarted = true;
+    fOpenedRet = true;
+    return true;
 }
 
 int static FormatHashBlocks(void* pbuffer, unsigned int len)
@@ -569,17 +606,24 @@ bool CheckStake(CBlock* pblock, CWallet& wallet)
     return true;
 }
 
-bool BuildStakeBlock(CWallet& wallet, const CStakeKernel& kernel, const StakeCoins& vCoins, int64_t nBalance, CBlockIndex* pindexPrev, unsigned int nBits, CBlock& blockRet)
+bool BuildStakeBlock(CWallet& wallet, const CStakeKernel& kernel, const StakeCoins& vCoins, int64_t nBalance, CBlockIndex* pindexPrev, unsigned int nBits, CBlock& blockRet, std::string& strFailRet)
 {
     AssertLockHeld(cs_main);
     AssertLockHeld(wallet.cs_wallet);
+    strFailRet.clear();
     if (pindexBest != pindexPrev)
+    {
+        strFailRet = "tip moved";
         return false;
+    }
 
     // A pass uses a staking coin only while the wallet still holds it; a staking
     // coin must still be unspent in the wallet
     if (!IsStakeCoinUsable(wallet, kernel.hashTx, kernel.pwtx, kernel.nOut))
+    {
+        strFailRet = "coin";
         return false;
+    }
 
     const unsigned int nTime = kernel.nTime;
     const int nHeight = pindexPrev->nHeight + 1;
@@ -607,7 +651,10 @@ bool BuildStakeBlock(CWallet& wallet, const CStakeKernel& kernel, const StakeCoi
     std::vector<const CWalletTx*> vwtxPrev;
     int64_t nCredit = 0;
     if (!wallet.BeginCoinStake(kernel, vCoins, nBalance, txCoinStake, vwtxPrev, nCredit))
+    {
+        strFailRet = "credit check";
         return false;
+    }
 
     // Memory pool transactions for the kernel's time and this height, none spending
     // a coinstake input. This also sets nLastBlockTx and nLastBlockSize.
@@ -618,13 +665,21 @@ bool BuildStakeBlock(CWallet& wallet, const CStakeKernel& kernel, const StakeCoi
 
     // The reward includes the fees of the transactions in the block
     if (!wallet.FinishCoinStake(nFees, nCredit, vwtxPrev, nHeight, txCoinStake))
+    {
+        strFailRet = "coinstake";
         return false;
+    }
 
     // Coinbase, coinstake, then the pool transactions; signed by the kernel key
     blockRet.vtx.insert(blockRet.vtx.begin() + 1, txCoinStake);
     blockRet.hashMerkleRoot = blockRet.BuildMerkleTree();
     CKey key(kernel.key);
-    return key.Sign(blockRet.GetHash(), blockRet.vchBlockSig);
+    if (!key.Sign(blockRet.GetHash(), blockRet.vchBlockSig))
+    {
+        strFailRet = "sign";
+        return false;
+    }
+    return true;
 }
 
 // Sleep nMilliseconds in steps of at most STAKE_MINER_SLEEP_MS; return early at shutdown.
@@ -654,6 +709,8 @@ static void StakeMinerPass(CWallet* pwallet, CStakeTxSourceCache& cache, int64_t
     bool fWindow = false;
     bool fCandidates = false;
     bool fKernel = false;
+    bool fBuilt = false;
+    std::string strBuildFail;
     int64_t nElapsed = 0;
     StakeCoins vCoins;
     int64_t nBalance = 0;
@@ -708,15 +765,13 @@ static void StakeMinerPass(CWallet* pwallet, CStakeTxSourceCache& cache, int64_t
         {
             LOCK2(cs_main, pwallet->cs_wallet);
             const int64_t nStart = GetTimeMicros();
-            if (pindexBest == pindexPrev)
+            CBlock block;
+            if (BuildStakeBlock(*pwallet, kernel, vCoins, nBalance, pindexPrev, nBits, block, strBuildFail))
             {
-                CBlock block;
-                if (BuildStakeBlock(*pwallet, kernel, vCoins, nBalance, pindexPrev, nBits, block))
-                {
-                    SetThreadPriority(THREAD_PRIORITY_NORMAL);
-                    CheckStake(&block, *pwallet);
-                    SetThreadPriority(THREAD_PRIORITY_LOWEST);
-                }
+                fBuilt = true;
+                SetThreadPriority(THREAD_PRIORITY_NORMAL);
+                CheckStake(&block, *pwallet);
+                SetThreadPriority(THREAD_PRIORITY_LOWEST);
             }
             nBuildMicros = GetTimeMicros() - nStart;
         }
@@ -725,9 +780,11 @@ static void StakeMinerPass(CWallet* pwallet, CStakeTxSourceCache& cache, int64_t
     if (fDebug)
     {
         const int64_t nSearched = fWindow ? nLast - nFirst + 1 : 0;
-        printf("StakeMiner : pass candidates=%" PRIszu " searched=%" PRId64 " lost=%" PRId64 " kernel=%d hold_us=%" PRId64 " (walk %" PRId64 ", search %" PRId64 ", build %" PRId64 ")\n",
-               vCoins.size(), nSearched, nElapsed - nSearched, fKernel ? 1 : 0,
+        printf("StakeMiner : pass candidates=%" PRIszu " searched=%" PRId64 " lost=%" PRId64 " kernel=%d built=%d hold_us=%" PRId64 " (walk %" PRId64 ", search %" PRId64 ", build %" PRId64 ")\n",
+               vCoins.size(), nSearched, nElapsed - nSearched, fKernel ? 1 : 0, fBuilt ? 1 : 0,
                nWalkMicros + nSearchMicros + nBuildMicros, nWalkMicros, nSearchMicros, nBuildMicros);
+        if (fKernel && !fBuilt)
+            printf("StakeMiner : kernel found, block not built: %s\n", strBuildFail.c_str());
     }
 }
 
@@ -738,10 +795,10 @@ void StakeMiner(CWallet *pwallet)
     // Make this thread recognisable as the mining thread
     RenameThread("pinkcoin-miner");
 
-    bool fTryToSync = true;
-
+    const unsigned int nMinStakePeers = GetMinStakePeers();
+    CStakeGateState gate;           // the start latch
     CStakeTxSourceCache cache;      // owned by this thread
-    int64_t nLastSearched = 0;      // set to now when staking starts
+    int64_t nLastSearched = 0;      // the latest second searched; set when staking starts
     int64_t nSleep = STAKE_MINER_SLEEP_MS;
 
     while (!fShutdown)
@@ -753,40 +810,25 @@ void StakeMiner(CWallet *pwallet)
 
         try
         {
-            while (pwallet->IsLocked())
+            size_t nPeers = 0;
+            {
+                LOCK(cs_vNodes);
+                nPeers = vNodes.size();
+            }
+            const int64_t nNow = GetAdjustedTime();
+            bool fOpened = false;
+            if (!CheckStakeGate(gate, pwallet->IsLocked(), nPeers, nMinStakePeers, IsInitialBlockDownload(), fTestNet, nNow, fOpened))
             {
                 nLastCoinStakeSearchInterval = 0;
-                MilliSleep(1000);
-                if (fShutdown)
-                    return;
+                continue;
             }
-
-            while (vNodes.empty() || IsInitialBlockDownload())
+            if (fOpened)
             {
-                nLastCoinStakeSearchInterval = 0;
-                fTryToSync = true;
-                MilliSleep(1000);
-                if (fShutdown)
-                    return;
-            }
-
-            if (fTryToSync)
-            {
-//                fTryToSync = false;
-
-                /*
-                 * If we have at least 3 peers and the same number or more blocks than our peers
-                 * then we can safely assume that we are on a sane chain.
-                 */
-
-                if ((vNodes.size() < (int)MIN_PEERS && !fTestNet) || nBestHeight < GetNumBlocksOfPeers())
-                {
-                    MilliSleep(60000);
-                    continue;
-                } else {
-                    fTryToSync = false;     // we only want to mine once we know for sure we're synced to the network.
-                    nLastSearched = GetAdjustedTime();
-                }
+                // The first pass searches the seconds after this one. Each second is
+                // searched at most once.
+                nLastSearched = std::max(nLastSearched, nNow);
+                if (fDebug)
+                    printf("StakeMiner : staking starts with %" PRIszu " peers\n", nPeers);
             }
 
             StakeMinerPass(pwallet, cache, nLastSearched);
