@@ -128,6 +128,125 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^i[3-6]86$")
     target_compile_options(pink2_core_defs INTERFACE -msse2)  # EXT_OPTIONS for i686
 endif()
 
+# The libraries every program links, as variables so that on macOS the daemon can
+# take static archives of them instead (below). Elsewhere they are used as they
+# are.
+set(PINK2_LIBS_MINIUPNPC MiniUPnPc::MiniUPnPc)
+set(PINK2_LIBS_BOOST Boost::filesystem Boost::program_options Boost::thread Boost::chrono)
+set(PINK2_LIBS_OPENSSL OpenSSL::SSL OpenSSL::Crypto)
+
+# macOS: a pink2d without Homebrew
+# --------------------------------
+#
+# The release ships the macOS pink2d on its own, outside the app bundle
+# (Pinkcoin-macOS-<arch>-<version>-pink2d.tar.xz), where nothing relocates its
+# libraries. So it links the static archives of Boost, OpenSSL and miniupnpc,
+# which Homebrew installs beside the dylibs, and loads only the OS's libraries,
+# as 2.4.0.0's did (makefile.osx STATIC=1). Pinkcoin-Qt and test_pink2 keep the
+# dylibs; macdeployqtplus bundles the GUI's.
+#
+# The libraries reach every program through pink2_core_defs, so the choice is
+# made per consumer: each item below becomes $<IF:static,twin,shared>, where
+# "static" is the consuming target's PINK2_STATIC_DEPS property (in a usage
+# requirement, $<TARGET_PROPERTY:prop> reads the target being linked). Only
+# pink2d sets it.
+if(APPLE AND ENABLE_DAEMON)
+    # pink2_static_twin(<out-var> <link item>): for a shared imported library, an
+    # imported target for the .a beside its .dylib, with the same compile usage
+    # requirements and its link interface mapped the same way (Boost::thread
+    # brings Boost::atomic, chrono, container and date_time). Anything else
+    # (Boost::headers, the static-only Boost::exception, Threads::Threads, flags)
+    # comes back unchanged.
+    function(pink2_static_twin out item)
+        set(${out} "${item}" PARENT_SCOPE)
+        string(REGEX REPLACE "^\\$<LINK_ONLY:(.+)>$" "\\1" _target "${item}")
+        if(NOT TARGET "${_target}")
+            return()
+        endif()
+        get_target_property(_aliased "${_target}" ALIASED_TARGET)
+        if(_aliased)
+            set(_target "${_aliased}")
+        endif()
+        string(REPLACE "::" "_" _twin "Pink2Static::${_target}")
+        if(TARGET "${_twin}")
+            set(${out} "${_twin}" PARENT_SCOPE)
+            return()
+        endif()
+        get_target_property(_type "${_target}" TYPE)
+        if(NOT _type MATCHES "^(SHARED|UNKNOWN)_LIBRARY$")
+            return()
+        endif()
+        set(_location "")
+        get_target_property(_configs "${_target}" IMPORTED_CONFIGURATIONS)
+        if(NOT _configs)
+            set(_configs "")
+        endif()
+        foreach(_suffix _RELEASE _NOCONFIG "" ${_configs})
+            if(_suffix AND NOT _suffix MATCHES "^_")
+                string(TOUPPER "_${_suffix}" _suffix)
+            endif()
+            get_target_property(_location "${_target}" IMPORTED_LOCATION${_suffix})
+            if(_location)
+                break()
+            endif()
+        endforeach()
+        if(NOT _location MATCHES "\\.dylib$")
+            return()
+        endif()
+        get_filename_component(_name "${_location}" NAME)
+        string(REGEX REPLACE "(\\.[0-9]+)*\\.dylib$" ".a" _name "${_name}")
+        get_filename_component(_dir "${_location}" DIRECTORY)
+        get_filename_component(_real_dir "${_location}" REALPATH)
+        get_filename_component(_real_dir "${_real_dir}" DIRECTORY)
+        set(_archive "")
+        foreach(_d "${_dir}" "${_real_dir}")
+            if(EXISTS "${_d}/${_name}")
+                set(_archive "${_d}/${_name}")
+                break()
+            endif()
+        endforeach()
+        if(NOT _archive)
+            message(FATAL_ERROR "pink2d links static archives on macOS, since it ships "
+                "outside the app bundle, and there is no ${_name} beside ${_location} "
+                "(for ${_target}).")
+        endif()
+        add_library("${_twin}" STATIC IMPORTED)
+        set_target_properties("${_twin}" PROPERTIES IMPORTED_LOCATION "${_archive}")
+        foreach(_prop INTERFACE_INCLUDE_DIRECTORIES INTERFACE_SYSTEM_INCLUDE_DIRECTORIES
+                      INTERFACE_COMPILE_DEFINITIONS INTERFACE_COMPILE_OPTIONS INTERFACE_LINK_OPTIONS)
+            get_target_property(_value "${_target}" ${_prop})
+            if(_value)
+                set_property(TARGET "${_twin}" PROPERTY ${_prop} "${_value}")
+            endif()
+        endforeach()
+        get_target_property(_deps "${_target}" INTERFACE_LINK_LIBRARIES)
+        set(_twin_deps "")
+        if(_deps)
+            foreach(_dep IN LISTS _deps)
+                pink2_static_twin(_dep_twin "${_dep}")
+                list(APPEND _twin_deps "${_dep_twin}")
+            endforeach()
+        endif()
+        set_property(TARGET "${_twin}" PROPERTY INTERFACE_LINK_LIBRARIES "${_twin_deps}")
+        message(STATUS "pink2d: ${_target} -> ${_archive}")
+        set(${out} "${_twin}" PARENT_SCOPE)
+    endfunction()
+
+    set(_pink2_static "$<BOOL:$<TARGET_PROPERTY:PINK2_STATIC_DEPS>>")
+    set(_pink2_lib_vars PINK2_LIBS_BOOST PINK2_LIBS_OPENSSL)
+    if(ENABLE_UPNP)
+        list(APPEND _pink2_lib_vars PINK2_LIBS_MINIUPNPC)
+    endif()
+    foreach(_var IN LISTS _pink2_lib_vars)
+        set(_items "")
+        foreach(_lib IN LISTS ${_var})
+            pink2_static_twin(_twin "${_lib}")
+            list(APPEND _items "$<IF:${_pink2_static},${_twin},${_lib}>")
+        endforeach()
+        set(${_var} "${_items}")
+    endforeach()
+endif()
+
 if(ENABLE_UPNP)
     # makefile.unix's USE_UPNP: 1 when UPnP is on at startup, 0 when it is
     # compiled in and off by default. ENABLE_UPNP=OFF defines nothing.
@@ -141,13 +260,13 @@ if(ENABLE_UPNP)
         # miniupnpc 2.x reads for the same thing.
         target_compile_definitions(pink2_core_defs INTERFACE STATICLIB MINIUPNP_STATICLIB)
     endif()
-    target_link_libraries(pink2_core_defs INTERFACE MiniUPnPc::MiniUPnPc)
+    target_link_libraries(pink2_core_defs INTERFACE ${PINK2_LIBS_MINIUPNPC})
 endif()
 
 target_link_libraries(pink2_core_defs INTERFACE
     ${LIBBDB_CXX}
-    Boost::headers Boost::filesystem Boost::program_options Boost::thread Boost::chrono
-    OpenSSL::SSL OpenSSL::Crypto
+    Boost::headers ${PINK2_LIBS_BOOST}
+    ${PINK2_LIBS_OPENSSL}
     ZLIB::ZLIB
     Threads::Threads
 )
@@ -186,6 +305,10 @@ if(ENABLE_DAEMON)
     add_executable(pink2d init.cpp noui.cpp)
     target_link_libraries(pink2d PRIVATE pink2_core ${PINK2_RUNTIME_LIBS})
     set_target_properties(pink2d PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    if(APPLE)
+        # Static Boost, OpenSSL and miniupnpc; see "macOS: a pink2d without Homebrew".
+        set_target_properties(pink2d PROPERTIES PINK2_STATIC_DEPS ON)
+    endif()
 
     add_test(NAME pink2d_help
         COMMAND ${CMAKE_COMMAND}

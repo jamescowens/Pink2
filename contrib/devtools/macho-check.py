@@ -3,12 +3,13 @@
 
 Usage:
   python3 -I contrib/devtools/macho-check.py bundle APP FLOOR
+  python3 -I contrib/devtools/macho-check.py binary FILE FLOOR
   python3 -I contrib/devtools/macho-check.py kegs MANIFEST DIR
 
 A small Mach-O reader (thin and fat files; LC_BUILD_VERSION and the older
-LC_VERSION_MIN_MACOSX; the dylib and rpath commands) behind two checks. It needs
-nothing but the Python standard library, so both run on Linux as well as on a
-Mac, without otool.
+LC_VERSION_MIN_MACOSX; the dylib and rpath commands) behind three checks. It
+needs nothing but the Python standard library, so they run on Linux as well as
+on a Mac, without otool.
 
 bundle  The app bundle the DMG ships (check-macos-bundle.sh calls this). Fails if
         - Contents/Info.plist's LSMinimumSystemVersion is missing or is not FLOOR;
@@ -22,6 +23,15 @@ bundle  The app bundle the DMG ships (check-macos-bundle.sh calls this). Fails i
           no file inside the bundle;
         - fewer than 10 Mach-O files could be read (a check that measured
           nothing would pass everything).
+
+binary  A program shipped on its own, outside any bundle, such as the release's
+        pink2d (check-macos-binary.sh calls this). Fails if FILE is not a
+        Mach-O executable, or if any slice
+        - records no minimum macOS, or one above FLOOR;
+        - has a load command naming an absolute path outside the OS (/usr/lib,
+          /System/Library), /usr/local and /opt/homebrew included;
+        - has a non-weak @executable_path, @loader_path or @rpath load: with
+          nothing shipped beside the program, there is nothing for it to find.
 
 kegs    The tarballs macos-restore-pinned-kegs.sh downloaded into DIR, one per
         MANIFEST entry, as <name>--<version>.tar.gz. Reads them in place,
@@ -344,6 +354,61 @@ def _bundle_resolve(ref, loader_dir, exe_dir, rpaths, app):
 
 
 # ---------------------------------------------------------------------------
+# binary
+# ---------------------------------------------------------------------------
+
+MH_EXECUTE = 2
+
+
+def cmd_binary(path, floor_text):
+    try:
+        floor = parse_version(floor_text)
+    except ValueError as exc:
+        print("ERROR: %s" % exc, file=sys.stderr)
+        return 2
+    if not os.path.isfile(path):
+        print("ERROR: no file %s" % path, file=sys.stderr)
+        return 2
+    with open(path, "rb") as f:
+        data = f.read()
+    try:
+        slices = parse_macho(data)
+    except MachOError as exc:
+        print("FAIL: %s: unreadable Mach-O: %s" % (path, exc))
+        return 1
+    if not slices:
+        print("FAIL: %s is not a Mach-O file" % path)
+        return 1
+
+    failures = []
+    print("Binary:         %s" % path)
+    print("Declared floor: %s" % floor_text)
+    for sl in slices:
+        tag = sl["arch"]
+        print("  [%s] minos %s" % (tag, fmt_version(sl["minos"])))
+        if sl["filetype"] != MH_EXECUTE:
+            failures.append("[%s] is not an executable (filetype %d)" % (tag, sl["filetype"]))
+        if sl["minos"] is None:
+            failures.append("[%s] records no minimum macOS" % tag)
+        elif sl["minos"] > floor:
+            failures.append("[%s] needs macOS %s, above %s" % (tag, fmt_version(sl["minos"]), floor_text))
+        for kind, p in sl["loads"] + [("LC_RPATH", rp) for rp in sl["rpaths"]]:
+            print("    %-20s %s" % (kind, p))
+            if p.startswith("/") and not is_system(p):
+                failures.append("[%s] %s %s%s is outside the OS" % (tag, kind, p, homebrew_note(p)))
+            elif p.startswith("@") and kind not in ("LC_LOAD_WEAK_DYLIB", "LC_RPATH"):
+                failures.append("[%s] %s %s: nothing ships beside this program to resolve it"
+                                % (tag, kind, p))
+    if failures:
+        for f in failures:
+            print("FAIL: %s" % f)
+        return 1
+    print("PASS: %s loads only the OS's libraries and honours the %s floor"
+          % (os.path.basename(path), floor_text))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # kegs
 # ---------------------------------------------------------------------------
 
@@ -595,6 +660,8 @@ def cmd_kegs(manifest, directory):
 def main(argv):
     if len(argv) == 4 and argv[1] == "bundle":
         return cmd_bundle(argv[2], argv[3])
+    if len(argv) == 4 and argv[1] == "binary":
+        return cmd_binary(argv[2], argv[3])
     if len(argv) == 4 and argv[1] == "kegs":
         return cmd_kegs(argv[2], argv[3])
     print(__doc__.split("\n\n")[1], file=sys.stderr)
