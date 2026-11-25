@@ -197,3 +197,10 @@ endif()
 if(ENABLE_TESTS)
     add_subdirectory(test)
 endif()
+
+# GUI
+# ===
+
+if(ENABLE_GUI)
+    add_subdirectory(qt)
+endif()

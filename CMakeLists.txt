@@ -173,6 +173,16 @@ if(ENABLE_GUI AND ENABLE_QRENCODE)
     find_package(QREncode REQUIRED)
 endif()
 
+# Qt 5, with the modules pinkcoin-qt.pro uses (widgets network svg, and dbus
+# with USE_DBUS). LinguistTools provides lrelease for the translations.
+if(ENABLE_GUI)
+    set(PINK2_QT_COMPONENTS Widgets Network Svg LinguistTools)
+    if(USE_DBUS)
+        list(APPEND PINK2_QT_COMPONENTS DBus)
+    endif()
+    find_package(Qt5 5.12 COMPONENTS ${PINK2_QT_COMPONENTS} REQUIRED)
+endif()
+
 
 # Hardening and PIE
 # =================
