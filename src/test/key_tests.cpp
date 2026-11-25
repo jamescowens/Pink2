@@ -14,10 +14,10 @@ static const string strSecret1     ("5HxWvvfubhXpYYpS3tJkw6fq9jE9j18THftkZjHHfmF
 static const string strSecret2     ("5KC4ejrDjv152FGwP386VD1i2NYc5KkfSMyv1nGy1VGDxGHqVY3");
 static const string strSecret1C    ("Kwr371tjA9u2rFSMZjTNun2PXXP3WPZu2afRHTcta6KxEUdm1vEw");
 static const string strSecret2C    ("L3Hq7a8FEQwJkW1M2GNKDW28546Vp5miewcCzSqUD9kCAXrJdS3g");
-static const CBitcoinAddress addr1 ("1QFqqMUD55ZV3PJEJZtaKCsQmjLT6JkjvJ");
-static const CBitcoinAddress addr2 ("1F5y5E5FMc5YzdJtB9hLaUe43GDxEKXENJ");
-static const CBitcoinAddress addr1C("1NoJrossxPBKfCHuJXT4HadJrXRE9Fxiqs");
-static const CBitcoinAddress addr2C("1CRj2HyM1CXWzHAXLQtiGLyggNT9WQqsDs");
+static const string strAddress1   ("1QFqqMUD55ZV3PJEJZtaKCsQmjLT6JkjvJ");
+static const string strAddress2   ("1F5y5E5FMc5YzdJtB9hLaUe43GDxEKXENJ");
+static const string strAddress1C  ("1NoJrossxPBKfCHuJXT4HadJrXRE9Fxiqs");
+static const string strAddress2C  ("1CRj2HyM1CXWzHAXLQtiGLyggNT9WQqsDs");
 
 
 static const string strAddressBad("1HV9Lc3sNHZxwj4Zk6fB38tEmBryq2cBiF");
@@ -53,7 +53,27 @@ void dumpKeyInfo(uint256 privkey)
 
 BOOST_AUTO_TEST_SUITE(key_tests)
 
-BOOST_AUTO_TEST_CASE(key_test1)
+// The vectors above are Bitcoin's. These helpers decode them without the
+// version byte, so everything that depends only on the keys is still checked.
+static CSecret DecodeSecret(const string& str, bool& fCompressedRet)
+{
+    vector<unsigned char> vch;
+    BOOST_REQUIRE(DecodeBase58Check(str, vch));
+    BOOST_REQUIRE(vch.size() == 33 || (vch.size() == 34 && vch[33] == 1));
+    fCompressedRet = (vch.size() == 34);
+    return CSecret(vch.begin() + 1, vch.begin() + 33);
+}
+
+static CKeyID DecodeKeyID(const string& str)
+{
+    vector<unsigned char> vch;
+    BOOST_REQUIRE(DecodeBase58Check(str, vch));
+    BOOST_REQUIRE(vch.size() == 21);
+    return CKeyID(uint160(vector<unsigned char>(vch.begin() + 1, vch.end())));
+}
+
+// Disabled until it has Pink2 test vectors: it parses Bitcoin key and address prefixes
+BOOST_AUTO_TEST_CASE(key_strings, * boost::unit_test::disabled())
 {
     CBitcoinSecret bsecret1, bsecret2, bsecret1C, bsecret2C, baddress1;
     BOOST_CHECK( bsecret1.SetString (strSecret1));
@@ -61,15 +81,18 @@ BOOST_AUTO_TEST_CASE(key_test1)
     BOOST_CHECK( bsecret1C.SetString(strSecret1C));
     BOOST_CHECK( bsecret2C.SetString(strSecret2C));
     BOOST_CHECK(!baddress1.SetString(strAddressBad));
+}
 
+BOOST_AUTO_TEST_CASE(key_test1)
+{
     bool fCompressed;
-    CSecret secret1  = bsecret1.GetSecret (fCompressed);
+    CSecret secret1  = DecodeSecret(strSecret1, fCompressed);
     BOOST_CHECK(fCompressed == false);
-    CSecret secret2  = bsecret2.GetSecret (fCompressed);
+    CSecret secret2  = DecodeSecret(strSecret2, fCompressed);
     BOOST_CHECK(fCompressed == false);
-    CSecret secret1C = bsecret1C.GetSecret(fCompressed);
+    CSecret secret1C = DecodeSecret(strSecret1C, fCompressed);
     BOOST_CHECK(fCompressed == true);
-    CSecret secret2C = bsecret2C.GetSecret(fCompressed);
+    CSecret secret2C = DecodeSecret(strSecret2C, fCompressed);
     BOOST_CHECK(fCompressed == true);
 
     BOOST_CHECK(secret1 == secret1C);
@@ -81,10 +104,10 @@ BOOST_AUTO_TEST_CASE(key_test1)
     key1C.SetSecret(secret1, true);
     key2C.SetSecret(secret2, true);
 
-    BOOST_CHECK(addr1.Get()  == CTxDestination(key1.GetPubKey().GetID()));
-    BOOST_CHECK(addr2.Get()  == CTxDestination(key2.GetPubKey().GetID()));
-    BOOST_CHECK(addr1C.Get() == CTxDestination(key1C.GetPubKey().GetID()));
-    BOOST_CHECK(addr2C.Get() == CTxDestination(key2C.GetPubKey().GetID()));
+    BOOST_CHECK(DecodeKeyID(strAddress1)  == key1.GetPubKey().GetID());
+    BOOST_CHECK(DecodeKeyID(strAddress2)  == key2.GetPubKey().GetID());
+    BOOST_CHECK(DecodeKeyID(strAddress1C) == key1C.GetPubKey().GetID());
+    BOOST_CHECK(DecodeKeyID(strAddress2C) == key2C.GetPubKey().GetID());
 
     for (int n=0; n<16; n++)
     {

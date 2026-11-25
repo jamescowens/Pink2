@@ -20,10 +20,22 @@ using namespace boost::assign;
 typedef vector<unsigned char> valtype;
 
 extern uint256 SignatureHash(CScript scriptCode, const CTransaction& txTo, unsigned int nIn, int nHashType);
-extern bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CTransaction& txTo, unsigned int nIn,
-                         bool fValidatePayToScriptHash, int nHashType);
 
 BOOST_AUTO_TEST_SUITE(multisig_tests)
+
+// CTxDestination also holds CStealthAddress, which has no operator==, so compare the key IDs
+static bool IsKeyID(const CTxDestination& dest, const CTxDestination& destKey)
+{
+    const CKeyID* p = boost::get<CKeyID>(&dest);
+    const CKeyID* q = boost::get<CKeyID>(&destKey);
+    return p && q && *p == *q;
+}
+
+static bool IsStandardScript(const CScript& scriptPubKey)
+{
+    txnouttype whichType;
+    return ::IsStandard(scriptPubKey, whichType);
+}
 
 CScript
 sign_multisig(CScript scriptPubKey, vector<CKey> keys, CTransaction transaction, int whichIn)
@@ -80,19 +92,19 @@ BOOST_AUTO_TEST_CASE(multisig_verify)
     keys.clear();
     keys += key[0],key[1]; // magic operator+= from boost.assign
     s = sign_multisig(a_and_b, keys, txTo[0], 0);
-    BOOST_CHECK(VerifyScript(s, a_and_b, txTo[0], 0, true, 0));
+    BOOST_CHECK(VerifyScript(s, a_and_b, txTo[0], 0, 0));
 
     for (int i = 0; i < 4; i++)
     {
         keys.clear();
         keys += key[i];
         s = sign_multisig(a_and_b, keys, txTo[0], 0);
-        BOOST_CHECK_MESSAGE(!VerifyScript(s, a_and_b, txTo[0], 0, true, 0), strprintf("a&b 1: %d", i));
+        BOOST_CHECK_MESSAGE(!VerifyScript(s, a_and_b, txTo[0], 0, 0), strprintf("a&b 1: %d", i));
 
         keys.clear();
         keys += key[1],key[i];
         s = sign_multisig(a_and_b, keys, txTo[0], 0);
-        BOOST_CHECK_MESSAGE(!VerifyScript(s, a_and_b, txTo[0], 0, true, 0), strprintf("a&b 2: %d", i));
+        BOOST_CHECK_MESSAGE(!VerifyScript(s, a_and_b, txTo[0], 0, 0), strprintf("a&b 2: %d", i));
     }
 
     // Test a OR b:
@@ -102,16 +114,16 @@ BOOST_AUTO_TEST_CASE(multisig_verify)
         keys += key[i];
         s = sign_multisig(a_or_b, keys, txTo[1], 0);
         if (i == 0 || i == 1)
-            BOOST_CHECK_MESSAGE(VerifyScript(s, a_or_b, txTo[1], 0, true, 0), strprintf("a|b: %d", i));
+            BOOST_CHECK_MESSAGE(VerifyScript(s, a_or_b, txTo[1], 0, 0), strprintf("a|b: %d", i));
         else
-            BOOST_CHECK_MESSAGE(!VerifyScript(s, a_or_b, txTo[1], 0, true, 0), strprintf("a|b: %d", i));
+            BOOST_CHECK_MESSAGE(!VerifyScript(s, a_or_b, txTo[1], 0, 0), strprintf("a|b: %d", i));
     }
     s.clear();
     s << OP_0 << OP_0;
-    BOOST_CHECK(!VerifyScript(s, a_or_b, txTo[1], 0, true, 0));
+    BOOST_CHECK(!VerifyScript(s, a_or_b, txTo[1], 0, 0));
     s.clear();
     s << OP_0 << OP_1;
-    BOOST_CHECK(!VerifyScript(s, a_or_b, txTo[1], 0, true, 0));
+    BOOST_CHECK(!VerifyScript(s, a_or_b, txTo[1], 0, 0));
 
 
     for (int i = 0; i < 4; i++)
@@ -121,9 +133,9 @@ BOOST_AUTO_TEST_CASE(multisig_verify)
             keys += key[i],key[j];
             s = sign_multisig(escrow, keys, txTo[2], 0);
             if (i < j && i < 3 && j < 3)
-                BOOST_CHECK_MESSAGE(VerifyScript(s, escrow, txTo[2], 0, true, 0), strprintf("escrow 1: %d %d", i, j));
+                BOOST_CHECK_MESSAGE(VerifyScript(s, escrow, txTo[2], 0, 0), strprintf("escrow 1: %d %d", i, j));
             else
-                BOOST_CHECK_MESSAGE(!VerifyScript(s, escrow, txTo[2], 0, true, 0), strprintf("escrow 2: %d %d", i, j));
+                BOOST_CHECK_MESSAGE(!VerifyScript(s, escrow, txTo[2], 0, 0), strprintf("escrow 2: %d %d", i, j));
         }
 }
 
@@ -135,19 +147,19 @@ BOOST_AUTO_TEST_CASE(multisig_IsStandard)
 
     CScript a_and_b;
     a_and_b << OP_2 << key[0].GetPubKey() << key[1].GetPubKey() << OP_2 << OP_CHECKMULTISIG;
-    BOOST_CHECK(::IsStandard(a_and_b));
+    BOOST_CHECK(IsStandardScript(a_and_b));
 
     CScript a_or_b;
     a_or_b  << OP_1 << key[0].GetPubKey() << key[1].GetPubKey() << OP_2 << OP_CHECKMULTISIG;
-    BOOST_CHECK(::IsStandard(a_or_b));
+    BOOST_CHECK(IsStandardScript(a_or_b));
 
     CScript escrow;
     escrow << OP_2 << key[0].GetPubKey() << key[1].GetPubKey() << key[2].GetPubKey() << OP_3 << OP_CHECKMULTISIG;
-    BOOST_CHECK(::IsStandard(escrow));
+    BOOST_CHECK(IsStandardScript(escrow));
 
     CScript one_of_four;
     one_of_four << OP_1 << key[0].GetPubKey() << key[1].GetPubKey() << key[2].GetPubKey() << key[3].GetPubKey() << OP_4 << OP_CHECKMULTISIG;
-    BOOST_CHECK(!::IsStandard(one_of_four));
+    BOOST_CHECK(!IsStandardScript(one_of_four));
 
     CScript malformed[6];
     malformed[0] << OP_3 << key[0].GetPubKey() << key[1].GetPubKey() << OP_2 << OP_CHECKMULTISIG;
@@ -158,7 +170,7 @@ BOOST_AUTO_TEST_CASE(multisig_IsStandard)
     malformed[5] << OP_1 << key[0].GetPubKey() << key[1].GetPubKey();
 
     for (int i = 0; i < 6; i++)
-        BOOST_CHECK(!::IsStandard(malformed[i]));
+        BOOST_CHECK(!IsStandardScript(malformed[i]));
 }
 
 BOOST_AUTO_TEST_CASE(multisig_Solver1)
@@ -193,7 +205,7 @@ BOOST_AUTO_TEST_CASE(multisig_Solver1)
         BOOST_CHECK(solutions.size() == 1);
         CTxDestination addr;
         BOOST_CHECK(ExtractDestination(s, addr));
-        BOOST_CHECK(addr == keyaddr[0]);
+        BOOST_CHECK(IsKeyID(addr, keyaddr[0]));
         BOOST_CHECK(IsMine(keystore, s));
         BOOST_CHECK(!IsMine(emptykeystore, s));
     }
@@ -206,7 +218,7 @@ BOOST_AUTO_TEST_CASE(multisig_Solver1)
         BOOST_CHECK(solutions.size() == 1);
         CTxDestination addr;
         BOOST_CHECK(ExtractDestination(s, addr));
-        BOOST_CHECK(addr == keyaddr[0]);
+        BOOST_CHECK(IsKeyID(addr, keyaddr[0]));
         BOOST_CHECK(IsMine(keystore, s));
         BOOST_CHECK(!IsMine(emptykeystore, s));
     }
@@ -233,8 +245,8 @@ BOOST_AUTO_TEST_CASE(multisig_Solver1)
         vector<CTxDestination> addrs;
         int nRequired;
         BOOST_CHECK(ExtractDestinations(s, whichType, addrs, nRequired));
-        BOOST_CHECK(addrs[0] == keyaddr[0]);
-        BOOST_CHECK(addrs[1] == keyaddr[1]);
+        BOOST_CHECK(IsKeyID(addrs[0], keyaddr[0]));
+        BOOST_CHECK(IsKeyID(addrs[1], keyaddr[1]));
         BOOST_CHECK(nRequired == 1);
         BOOST_CHECK(IsMine(keystore, s));
         BOOST_CHECK(!IsMine(emptykeystore, s));
