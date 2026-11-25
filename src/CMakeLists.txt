@@ -151,86 +151,8 @@ set(PINK2_LIBS_OPENSSL OpenSSL::SSL OpenSSL::Crypto)
 # requirement, $<TARGET_PROPERTY:prop> reads the target being linked). Only
 # pink2d sets it.
 if(APPLE AND ENABLE_DAEMON)
-    # pink2_static_twin(<out-var> <link item>): for a shared imported library, an
-    # imported target for the .a beside its .dylib, with the same compile usage
-    # requirements and its link interface mapped the same way (Boost::thread
-    # brings Boost::atomic, chrono, container and date_time). Anything else
-    # (Boost::headers, the static-only Boost::exception, Threads::Threads, flags)
-    # comes back unchanged.
-    function(pink2_static_twin out item)
-        set(${out} "${item}" PARENT_SCOPE)
-        string(REGEX REPLACE "^\\$<LINK_ONLY:(.+)>$" "\\1" _target "${item}")
-        if(NOT TARGET "${_target}")
-            return()
-        endif()
-        get_target_property(_aliased "${_target}" ALIASED_TARGET)
-        if(_aliased)
-            set(_target "${_aliased}")
-        endif()
-        string(REPLACE "::" "_" _twin "Pink2Static::${_target}")
-        if(TARGET "${_twin}")
-            set(${out} "${_twin}" PARENT_SCOPE)
-            return()
-        endif()
-        get_target_property(_type "${_target}" TYPE)
-        if(NOT _type MATCHES "^(SHARED|UNKNOWN)_LIBRARY$")
-            return()
-        endif()
-        set(_location "")
-        get_target_property(_configs "${_target}" IMPORTED_CONFIGURATIONS)
-        if(NOT _configs)
-            set(_configs "")
-        endif()
-        foreach(_suffix _RELEASE _NOCONFIG "" ${_configs})
-            if(_suffix AND NOT _suffix MATCHES "^_")
-                string(TOUPPER "_${_suffix}" _suffix)
-            endif()
-            get_target_property(_location "${_target}" IMPORTED_LOCATION${_suffix})
-            if(_location)
-                break()
-            endif()
-        endforeach()
-        if(NOT _location MATCHES "\\.dylib$")
-            return()
-        endif()
-        get_filename_component(_name "${_location}" NAME)
-        string(REGEX REPLACE "(\\.[0-9]+)*\\.dylib$" ".a" _name "${_name}")
-        get_filename_component(_dir "${_location}" DIRECTORY)
-        get_filename_component(_real_dir "${_location}" REALPATH)
-        get_filename_component(_real_dir "${_real_dir}" DIRECTORY)
-        set(_archive "")
-        foreach(_d "${_dir}" "${_real_dir}")
-            if(EXISTS "${_d}/${_name}")
-                set(_archive "${_d}/${_name}")
-                break()
-            endif()
-        endforeach()
-        if(NOT _archive)
-            message(FATAL_ERROR "pink2d links static archives on macOS, since it ships "
-                "outside the app bundle, and there is no ${_name} beside ${_location} "
-                "(for ${_target}).")
-        endif()
-        add_library("${_twin}" STATIC IMPORTED)
-        set_target_properties("${_twin}" PROPERTIES IMPORTED_LOCATION "${_archive}")
-        foreach(_prop INTERFACE_INCLUDE_DIRECTORIES INTERFACE_SYSTEM_INCLUDE_DIRECTORIES
-                      INTERFACE_COMPILE_DEFINITIONS INTERFACE_COMPILE_OPTIONS INTERFACE_LINK_OPTIONS)
-            get_target_property(_value "${_target}" ${_prop})
-            if(_value)
-                set_property(TARGET "${_twin}" PROPERTY ${_prop} "${_value}")
-            endif()
-        endforeach()
-        get_target_property(_deps "${_target}" INTERFACE_LINK_LIBRARIES)
-        set(_twin_deps "")
-        if(_deps)
-            foreach(_dep IN LISTS _deps)
-                pink2_static_twin(_dep_twin "${_dep}")
-                list(APPEND _twin_deps "${_dep_twin}")
-            endforeach()
-        endif()
-        set_property(TARGET "${_twin}" PROPERTY INTERFACE_LINK_LIBRARIES "${_twin_deps}")
-        message(STATUS "pink2d: ${_target} -> ${_archive}")
-        set(${out} "${_twin}" PARENT_SCOPE)
-    endfunction()
+    # pink2_static_twin(): build-aux/cmake/Pink2StaticTwin.cmake.
+    include(Pink2StaticTwin)
 
     set(_pink2_static "$<BOOL:$<TARGET_PROPERTY:PINK2_STATIC_DEPS>>")
     set(_pink2_lib_vars PINK2_LIBS_BOOST PINK2_LIBS_OPENSSL)
@@ -315,6 +237,14 @@ if(ENABLE_DAEMON)
             -DPINK2D=$<TARGET_FILE:pink2d>
             -DPINK2_VERSION=${PINK2_VERSION}
             -P "${CMAKE_SOURCE_DIR}/build-aux/cmake/tests/check_help.cmake")
+
+    # The pink2d the release ships on its own loads only the OS's libraries and
+    # honours the build's floor (contrib/devtools/check-macos-binary.sh).
+    if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET)
+        add_test(NAME pink2d_macos_static
+            COMMAND "${CMAKE_SOURCE_DIR}/contrib/devtools/check-macos-binary.sh"
+                    $<TARGET_FILE:pink2d> "${CMAKE_OSX_DEPLOYMENT_TARGET}")
+    endif()
 endif()
 
 if(ENABLE_TESTS)
