@@ -151,6 +151,17 @@ packages/qt.mk (1ceea's, with these changes)
   - QColorDialog is kept (no -no-feature-colordialog): src/qt/plugins/
     mrichtexteditor/mrichtextedit.cpp uses it, and the header refuses to
     compile with the feature off.
+  - HTTPS is kept: -openssl-linked instead of -no-openssl, and no
+    -no-feature-http. The overview page fetches its price from
+    https://api.coingecko.com through QNetworkAccessManager
+    (src/qt/overviewpage.cpp), and 2.4.0.0's release Qt was built with
+    -openssl-linked. Qt links depends' own static OpenSSL 3.5.9: openssl is
+    a dependency of qt, and configure gets OPENSSL_LIBS from
+    $(package)_openssl_libs_<os>, which is depends' libssl and libcrypto
+    plus what OpenSSL itself needs (-ldl -lpthread on Linux, from
+    libcrypto.pc; -lws2_32 -lgdi32 -lcrypt32 on mingw, OpenSSL's mingw64
+    ex_libs and what 2.4.0.0's Windows build passed). Qt 5.15.5 supports
+    OpenSSL 3 (its sources guard on OPENSSL_VERSION_MAJOR).
   - -no-feature-gssapi and -no-tslib: otherwise configure finds Kerberos
     GSSAPI and tslib in the build machine's /usr and links them. Nothing in
     Pinkcoin uses either.
@@ -171,8 +182,8 @@ packages/qt.mk (1ceea's, with these changes)
         lib/cmake/Qt5LinguistTools/*, and the stage step installs only those
         files (install_cmake_linguist_tools_files). Only lrelease, lupdate
         and lconvert are built, as at 1ceea.
-  Everything else (configure options, patches, the build of qtbase, qtsvg,
-  qttranslations and the three linguist tools) is 1ceea's.
+  Everything else (the other configure options, patches, the build of qtbase,
+  qtsvg, qttranslations and the three linguist tools) is 1ceea's.
 
 packages/libxcb.mk, packages/fontconfig.mk, packages/libxcb_util_image.mk
 (1ceea's)
@@ -244,8 +255,11 @@ Notes for users of this tree
     Qt5::QSvgIconPlugin with Q_IMPORT_PLUGIN). The Qt 4 codec plugins that
     src/qt/bitcoin.cpp imports under BITCOIN_NEED_QT_PLUGINS do not exist in
     Qt 5; the codecs are built into QtCore.
-  - Qt is configured with -no-openssl and -no-feature-http (1ceea), so the
-    overview page's HTTPS price request gets no reply.
+  - Qt finds the system CA certificates itself at run time
+    (QSslSocketPrivate::unixRootCertDirectories, /etc/ssl/certs/ first, on
+    Linux; the ROOT system store on Windows). Depends' OpenSSL loads no
+    configuration file (no-autoload-config), and its OPENSSLDIR is a build
+    path that nothing reads.
   - Source fallback: FALLBACK_DOWNLOAD_PATHS is Gridcoin's, bitcoincore.org's
     depends-sources first, then Gridcoin's S3 mirror.
   - After a failed build, remove depends/<host>/.<package>_stamp_configured
