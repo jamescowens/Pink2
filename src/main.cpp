@@ -12,6 +12,7 @@
 #include "init.h"
 #include "ui_interface.h"
 #include "kernel.h"
+#include "stakeproofs.h"
 #include "smessage.h"
 #include "time.h"
 #include <boost/algorithm/string/replace.hpp>
@@ -2342,6 +2343,12 @@ bool CBlock::AcceptBlock()
         {
             printf("WARNING: AcceptBlock(): check proof-of-stake failed for block %s\n", hash.ToString().c_str());
             return false; // do not error here as we expect this during initial block download
+        }
+        if (const uint256* p = GetFixedStakeProof(hash))
+        {
+            if (fDebug)
+                printf("AcceptBlock() : block %s: proof hash %s\n", hash.ToString().c_str(), p->ToString().c_str());
+            hashProof = *p;
         }
     }
     // PoW is checked in CheckBlock()
