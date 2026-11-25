@@ -133,10 +133,17 @@ instance_of_cinit;
 
 void RandAddSeed()
 {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    // OpenSSL 3 seeds and reseeds its DRBG from the OS by itself. There RAND_add
+    // forces a full reseed, and ProcessMessage calls this for every P2P message:
+    // about 20 ms each where the seed source is jitterentropy (SUSE's FIPS build).
+    // The performance counter adds nothing worth that, so leave the DRBG alone.
+#else
     // Seed with CPU performance counter
     int64_t nCounter = GetPerformanceCounter();
     RAND_add(&nCounter, sizeof(nCounter), 1.5);
     memset(&nCounter, 0, sizeof(nCounter));
+#endif
 }
 
 void RandAddSeedPerfmon()
@@ -1055,7 +1062,7 @@ const boost::filesystem::path &GetDataDir(bool fNetSpecific)
 boost::filesystem::path GetConfigFile()
 {
     boost::filesystem::path pathConfigFile(GetArg("-conf", "pinkconf.txt"));
-    if (!pathConfigFile.is_complete()) pathConfigFile = GetDataDir(false) / pathConfigFile;
+    if (!pathConfigFile.is_absolute()) pathConfigFile = GetDataDir(false) / pathConfigFile;
 
     if (!boost::filesystem::exists(pathConfigFile))
     {
@@ -1092,7 +1099,7 @@ void ReadConfigFile(map<string, string>& mapSettingsRet,
 boost::filesystem::path GetPidFile()
 {
     boost::filesystem::path pathPidFile(GetArg("-pid", "pinkcoind.pid"));
-    if (!pathPidFile.is_complete()) pathPidFile = GetDataDir() / pathPidFile;
+    if (!pathPidFile.is_absolute()) pathPidFile = GetDataDir() / pathPidFile;
     return pathPidFile;
 }
 

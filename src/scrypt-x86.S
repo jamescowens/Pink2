@@ -22,11 +22,12 @@
 # OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 # SUCH DAMAGE.
 
-#if defined(OPTIMIZED_SALSA) &&  defined(__i386__)
-
+/* Outside the OPTIMIZED_SALSA guard, so the object gets a non-executable stack even when empty */
 #if defined(__linux__) && defined(__ELF__)
 .section .note.GNU-stack,"",%progbits
 #endif
+
+#if defined(OPTIMIZED_SALSA) &&  defined(__i386__)
 
 #define pink_salsa8_core_quadround() \
 	movl	52(%esp), %ecx; \

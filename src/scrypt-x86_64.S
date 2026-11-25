@@ -23,11 +23,12 @@
 # SUCH DAMAGE.
 
 
-#if defined(OPTIMIZED_SALSA) && defined(__x86_64__)
-
+/* Outside the OPTIMIZED_SALSA guard, so the object gets a non-executable stack even when empty */
 #if defined(__linux__) && defined(__ELF__)
 	.section .note.GNU-stack,"",%progbits
 #endif
+
+#if defined(OPTIMIZED_SALSA) && defined(__x86_64__)
 
 #define scrypt_shuffle(src, so, dest, do) \
 	movl	so+60(src), %r8d; \
