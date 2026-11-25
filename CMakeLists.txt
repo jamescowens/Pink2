@@ -394,3 +394,70 @@ if(ENABLE_TESTS)
     target_link_libraries(bdb48_smoke PRIVATE ${LIBBDB_CXX} Threads::Threads)
     add_test(NAME bdb48_smoke COMMAND bdb48_smoke)
 endif()
+
+
+# Install and release archives
+# ============================
+
+# The Linux and Windows release assets are CPack archives shaped like 2.4.0.0's:
+# pink2d and Pinkcoin-Qt at the archive root, no directory, stripped (2.4.0.0's
+# release stripped pink2d), in Pinkcoin-Linux-<version>.tar.xz and
+# Pinkcoin-Win64-<version>.zip:
+#   cpack -G TXZ --config <build>/CPackConfig.cmake    (Linux)
+#   cpack -G ZIP --config <build>/CPackConfig.cmake    (Windows)
+#
+# The programs are installed twice. `cmake --install` puts them in <prefix>/bin
+# (component Runtime). The archives take only the Release component, which puts
+# them at the root and is left out of a plain `cmake --install`
+# (EXCLUDE_FROM_ALL). CPack's archive generators keep a component's own paths,
+# and ALL_COMPONENTS_IN_ONE makes one archive under CPACK_PACKAGE_FILE_NAME.
+#
+# Not on macOS: the release there is the deploy target's DMG (src/qt) and a
+# pink2d tarball the workflow makes.
+if(NOT APPLE)
+    include(GNUInstallDirs)
+    set(_pink2_programs "")
+    foreach(_t pink2d Pinkcoin-Qt)
+        if(TARGET ${_t})
+            list(APPEND _pink2_programs ${_t})
+        endif()
+    endforeach()
+    if(_pink2_programs)
+        install(TARGETS ${_pink2_programs}
+            RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT Runtime)
+        install(TARGETS ${_pink2_programs}
+            RUNTIME DESTINATION . COMPONENT Release EXCLUDE_FROM_ALL)
+    endif()
+
+    if(WIN32)
+        if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+            set(_pink2_platform Win64)
+        else()
+            set(_pink2_platform Win32)
+        endif()
+        set(CPACK_GENERATOR ZIP)
+    else()
+        # The release asset is x86_64 and names no architecture, as 2.4.0.0's.
+        set(_pink2_platform "${CMAKE_SYSTEM_NAME}")
+        if(NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+            string(APPEND _pink2_platform "-${CMAKE_SYSTEM_PROCESSOR}")
+        endif()
+        set(CPACK_GENERATOR TXZ)
+    endif()
+
+    set(CPACK_PACKAGE_NAME "Pinkcoin")
+    set(CPACK_PACKAGE_VENDOR "Pinkcoin developers")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "${PROJECT_DESCRIPTION}")
+    # CPack builds its version from MAJOR.MINOR.PATCH; the release is four-part.
+    set(CPACK_PACKAGE_VERSION "${PINK2_VERSION}")
+    set(CPACK_PACKAGE_FILE_NAME "Pinkcoin-${_pink2_platform}-${PINK2_VERSION}")
+    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/COPYING")
+    set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
+    set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
+    set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)
+    set(CPACK_COMPONENTS_ALL Release)
+    set(CPACK_STRIP_FILES ON)
+    include(CPack)
+    unset(_pink2_programs)
+    unset(_pink2_platform)
+endif()

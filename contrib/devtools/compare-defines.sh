@@ -2,14 +2,27 @@
 # Compare the preprocessor defines the old makefile build gives src/main.cpp
 # with the ones the CMake build gives it.
 #
-# Usage: contrib/devtools/compare-defines.sh <build-dir> [make vars...]
+# Usage: contrib/devtools/compare-defines.sh [--ignore REGEX]... <build-dir> [make vars...]
 #   e.g. contrib/devtools/compare-defines.sh build
 #        contrib/devtools/compare-defines.sh build-upnp1 USE_UPNP=1
+#        contrib/devtools/compare-defines.sh \
+#            --ignore '^BOOST_[A-Z0-9_]+_(STATIC_LINK|DYN_LINK|NO_LIB)$|^BOOST_THREAD_USE_LIB$' \
+#            build-dep USE_UPNP=1
 #
 # Prints the sorted -D set of `make -n -f makefile.unix obj/main.o <vars>` and
 # the sorted -D set for src/main.cpp from <build-dir>/compile_commands.json
 # (configure with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON), and exits 1 if they
 # differ. This checks the Linux makefile (makefile.unix) only.
+#
+# --ignore REGEX (an extended regular expression, may be repeated,
+# before or after <build-dir>) removes every define whose NAME matches it from
+# both sides before they are compared. The name is what follows -D, up to any
+# '='; anchor the expression (^...$) to match whole names. Each removed define
+# is printed, so the log shows what the comparison did not cover. The release
+# build uses it for the linkage-selection macros Boost's CMake package puts on
+# a static Boost (BOOST_<LIB>_STATIC_LINK, BOOST_THREAD_USE_LIB), which choose
+# between the Windows DLL and static entry points and compile no different code
+# on Linux.
 
 set -eu
 
@@ -17,13 +30,51 @@ set -eu
 LC_ALL=C
 export LC_ALL
 
-if [ $# -lt 1 ]; then
-    echo "Usage: $0 <build-dir> [make vars...]" >&2
+usage() {
+    echo "Usage: $0 [--ignore REGEX]... <build-dir> [make vars...]" >&2
     exit 2
-fi
+}
 
-BUILD_DIR=$1
-shift
+# Options may come anywhere; everything else is <build-dir>, then the make
+# variables, which are rotated to the end of "$@" in their order.
+IGNORE=""
+BUILD_DIR=""
+n=$#
+while [ "$n" -gt 0 ]; do
+    a=$1
+    shift
+    n=$((n - 1))
+    case $a in
+        --ignore)
+            [ "$n" -gt 0 ] || usage
+            re=$1
+            shift
+            n=$((n - 1))
+            ;;
+        --ignore=*)
+            re=${a#--ignore=}
+            ;;
+        -*)
+            echo "$0: unknown option: $a" >&2
+            usage
+            ;;
+        *)
+            if [ -z "$BUILD_DIR" ]; then
+                BUILD_DIR=$a
+            else
+                set -- "$@" "$a"
+            fi
+            continue
+            ;;
+    esac
+    [ -n "$re" ] || { echo "$0: --ignore needs a non-empty REGEX" >&2; exit 2; }
+    # grep exits 2 on an invalid expression, 0 or 1 otherwise.
+    rc=0
+    printf '\n' | grep -E -e "$re" >/dev/null 2>&1 || rc=$?
+    [ "$rc" -le 1 ] || { echo "$0: --ignore: not an extended regular expression: $re" >&2; exit 2; }
+    IGNORE="${IGNORE:+$IGNORE|}($re)"
+done
+[ -n "$BUILD_DIR" ] || usage
 
 TOP=$(cd "$(dirname "$0")/../.." && pwd)
 CC_JSON="$BUILD_DIR/compile_commands.json"
@@ -71,6 +122,24 @@ echo "== makefile.unix $* =="
 cat "$TMP/make.defs"
 echo "== CMake ($BUILD_DIR) =="
 cat "$TMP/cmake.defs"
+
+# --ignore: split each list into the defines compared and the ones dropped, by
+# name. The expression goes through the environment, not awk -v, which would
+# rewrite its backslashes.
+if [ -n "$IGNORE" ]; then
+    for side in make cmake; do
+        IGNORE_RE=$IGNORE awk -v kept="$TMP/$side.kept" -v dropped="$TMP/$side.dropped" '
+            { name = $0; sub(/^-D/, "", name); sub(/=.*/, "", name)
+              if (name ~ ENVIRON["IGNORE_RE"]) print > dropped; else print > kept }
+            END { printf "" > kept; printf "" > dropped }' "$TMP/$side.defs"
+        mv "$TMP/$side.kept" "$TMP/$side.defs"
+    done
+    echo "== ignored (names matching $IGNORE) =="
+    echo "makefile.unix:"
+    sed 's/^/    /' "$TMP/make.dropped"
+    echo "CMake:"
+    sed 's/^/    /' "$TMP/cmake.dropped"
+fi
 
 if diff -u "$TMP/make.defs" "$TMP/cmake.defs" >"$TMP/diff"; then
     echo "defines match"
