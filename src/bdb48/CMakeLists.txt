@@ -202,14 +202,32 @@ message(STATUS "Berkeley DB (bundled): CXXFLAGS=${BDB_CXX_FLAGS}")
 
 # Make flags
 # ==========
-
-include(ProcessorCount)
-ProcessorCount(N)
-if(N EQUAL 0)
-    set(N 1)
+#
+# BDB's make runs as many jobs as the build it is part of, not one per CPU.
+#
+# With a Makefile generator the build step is a recursive $(MAKE), which joins
+# the outer make's job server: the -j of `cmake --build -j N` (or of
+# CMAKE_BUILD_PARALLEL_LEVEL, which cmake --build turns into -j) bounds BDB's
+# compiles and the rest of the tree's together, and a serial build builds BDB
+# serially. ExternalProject keeps the $(MAKE) on the recipe line when it wraps
+# the step for LOG_BUILD. The sub-make also inherits the outer make's -s, so
+# BDB's build log holds its warnings and errors but not its command lines.
+#
+# Other generators (Ninja) have no job server to share. There BDB's make takes
+# -j from CMAKE_BUILD_PARALLEL_LEVEL in the configure environment, and runs one
+# job without it.
+#
+# `make clean` runs in the configure step, after configure, so a reconfigured
+# BDB (new flags) is rebuilt from scratch; the build step runs only after the
+# configure step, and BDB's Makefile does not track flags.
+if(CMAKE_GENERATOR MATCHES "^(Unix|MinGW|MSYS) Makefiles$")
+    set(BDB_MAKE "$(MAKE)")
+else()
+    set(BDB_MAKE "${MAKE_EXE}")
+    if("$ENV{CMAKE_BUILD_PARALLEL_LEVEL}" MATCHES "^[1-9][0-9]*$")
+        list(APPEND BDB_MAKE "-j$ENV{CMAKE_BUILD_PARALLEL_LEVEL}")
+    endif()
 endif()
-
-set(MAKEOPTS "-j${N}" CACHE STRING "Options for the 'make' program")
 
 
 # External project
@@ -219,9 +237,8 @@ ExternalProject_Add(BerkeleyDB_Project
     SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}
     BINARY_DIR ${LIBDB_BUILD_DIR}
     CONFIGURE_COMMAND ${SH_EXE} ${CMAKE_CURRENT_SOURCE_DIR}/dist/configure ${BDB_FLAGS}
-    BUILD_COMMAND
-        COMMAND ${MAKE_EXE} ${MAKEOPTS} clean
-        COMMAND ${MAKE_EXE} ${MAKEOPTS} libdb_cxx.a
+        COMMAND ${MAKE_EXE} clean
+    BUILD_COMMAND ${BDB_MAKE} libdb_cxx.a
     INSTALL_COMMAND ""
     BUILD_BYPRODUCTS ${libdb_cxx_library}
     LOG_CONFIGURE TRUE
