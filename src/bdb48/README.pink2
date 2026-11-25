@@ -1,0 +1,52 @@
+Berkeley DB 4.8.30.NC, vendored for Pinkcoin (Pink2)
+====================================================
+
+Origin:  db-4.8.30.NC.tar.gz
+         https://download.oracle.com/berkeley-db/db-4.8.30.NC.tar.gz
+         (mirror: https://gridcoin-depends-backup-sources.s3.us-east-1.amazonaws.com/db-4.8.30.NC.tar.gz)
+sha256:  12edc0df75bf9abd7f82f821795bcee50f42cb2e5f76a6a281b85732798364ef
+
+Why 4.8: Pinkcoin wallets and block indexes are BDB 4.8 files, and every
+2.4.0.0 release opens them with it. This tree is compiled from source so that
+every platform build uses the same BDB. src/bdb48/CMakeLists.txt builds it with
+its own configure under ExternalProject, as Gridcoin builds its bundled 5.3.
+Configure flags: --enable-cxx --disable-shared --disable-replication, plus
+--with-pic with ENABLE_PIE and --enable-mingw on Windows. No -DUNICODE or
+-D_UNICODE on Windows: 2.4.0.0's BDB had neither, and Pink2 gives BDB narrow
+paths in the ANSI code page.
+
+Changes from the tarball (git history: two commits, the import and the rename)
+-----------------------------------------------------------------------------
+
+Removed directories, none of which configure or make reads for the static C++
+library (the build is checked by building libdb_cxx.a natively and for MinGW):
+
+  docs docs_src         documentation
+  examples_c examples_cxx examples_java examples_csharp examples_stl
+                        example programs
+  java csharp libdb_java libdb_csharp
+                        Java and C# bindings (configure is run without them)
+  tcl                   Tcl API (needs --enable-tcl)
+  perl php_db4 mod_db4  Perl, PHP and Apache bindings
+  test test_micro test_stl
+                        Tcl test suite and benchmarks, except test/include.tcl,
+                        which dist/configure lists as an input file of
+                        config.status
+  build_brew build_s60 build_vxworks build_wince build_windows
+                        project files for other build systems (MinGW builds
+                        through dist/configure with --enable-mingw, and
+                        os_windows is kept)
+  os_brew os_qnx os_s60 os_vxworks
+                        OS layers for platforms Pinkcoin does not build for
+
+Kept although unused here: stl, db_sql, dist, and the command-line utilities
+(db_dump and the others), which dist/Makefile.in expects.
+
+Renames (whole words, in dbinc/atomic.h and mp/*.c, mutex/*.c): the
+identifiers __atomic_compare_exchange and atomic_init collide with compiler
+builtins in current GCC and Clang, so they are now __atomic_compare_exchange_db
+and atomic_init_db. This is the recipe of .github/scripts/build-bdb48.sh in the
+compat CI. Nothing else in the tree is modified.
+
+The 2010 config.guess and config.sub do not know arm64 macOS. Builds on such a
+host pass --host explicitly (CMAKE_C_COMPILER_TARGET) or replace the two files.
