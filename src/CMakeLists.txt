@@ -109,7 +109,11 @@ if(WIN32)
     # on LLP64.
     target_compile_definitions(pink2_core_defs INTERFACE
         _MT WIN32 _WINDOWS BOOST_THREAD_USE_LIB BOOST_THREAD_PROVIDES_GENERIC_SHARED_MUTEX_ON_WIN)
+    # -mthreads at link time too, as makefile.linux-mingw (its CFLAGS are on the
+    # link line): it links mingwthrd, the thread-safe exception support the .pro
+    # adds as -lmingwthrd.
     target_compile_options(pink2_core_defs INTERFACE -mthreads)
+    target_link_options(pink2_core_defs INTERFACE -mthreads)
 else()
     if(CMAKE_SIZEOF_VOID_P EQUAL 8)
         # makefile.unix passes it unconditionally; pinkcoin-qt.pro on macOS.
@@ -195,6 +199,11 @@ target_link_libraries(pink2_core_defs INTERFACE
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # -l rt -l dl, as makefile.unix
     find_library(PINK2_RT_LIBRARY rt)
+    if(NOT PINK2_RT_LIBRARY)
+        # A depends toolchain confines find_library() to depends, which has no
+        # librt. The linker finds the system's by name.
+        set(PINK2_RT_LIBRARY rt)
+    endif()
     target_link_libraries(pink2_core_defs INTERFACE ${PINK2_RT_LIBRARY} ${CMAKE_DL_LIBS})
 endif()
 if(WIN32)

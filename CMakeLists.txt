@@ -87,6 +87,13 @@ project(Pinkcoin
     LANGUAGES C CXX ASM
 )
 
+# The GUI's icon and version resource, src/qt/res/bitcoin-qt.rc (the .pro's
+# RC_FILE). CMake's MinGW platform files enable RC already; this states it, at
+# the top level, where enable_language() has to be.
+if(WIN32)
+    enable_language(RC)
+endif()
+
 
 # Toolchain configuration
 # =======================
@@ -150,8 +157,15 @@ include(CheckCXXCompilerFlag)
 include(CheckLinkerFlag)
 include(CheckPIESupported)
 
-# Static linking must be set up before the dependencies are searched for.
+# Static linking must be set up before the dependencies are searched for. The
+# platform's own suffix list is kept for the Qt search below.
+set(PINK2_DEFAULT_FIND_LIBRARY_SUFFIXES "${CMAKE_FIND_LIBRARY_SUFFIXES}")
 if(STATIC_LIBS)
+    # The programs ship from the build tree. CMake's build RPATH would point
+    # them at the build machine's library directories (on Linux, depends' lib,
+    # for the X11 libraries the GUI links shared there and takes from the
+    # system at run time).
+    set(CMAKE_SKIP_BUILD_RPATH ON)
     set(CMAKE_LINK_SEARCH_START_STATIC ON)
     set(CMAKE_FIND_LIBRARY_SUFFIXES "${CMAKE_STATIC_LIBRARY_SUFFIX}")
     set(Boost_USE_STATIC_LIBS ON)
@@ -242,7 +256,39 @@ if(ENABLE_GUI)
     if(USE_DBUS)
         list(APPEND PINK2_QT_COMPONENTS DBus)
     endif()
+
+    # A static Qt (depends) lists its own dependencies in .prl files, and its
+    # CMake package find_library()s every -l in them: the system's libm, the
+    # MinGW import libraries, and on Linux depends' X11 libraries, which depends
+    # builds shared. Two settings would hide some of those, so for this search
+    # only, as Bitcoin Core v29's FindQt.cmake does with the first:
+    #  - the depends toolchain's CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY confines
+    #    find_library() to depends ("Library not found: m"); BOTH still searches
+    #    depends first;
+    #  - STATIC_LIBS' static-only suffix list would skip libxcb.so and
+    #    libfontconfig.so, and resolve -lm to the system's static libm.a.
+    # Both are restored afterwards, so every other package is still found in
+    # depends only, and statically.
+    set(_qt_saved_root_mode_defined FALSE)
+    if(DEFINED CMAKE_FIND_ROOT_PATH_MODE_LIBRARY)
+        set(_qt_saved_root_mode_defined TRUE)
+        set(_qt_saved_root_mode "${CMAKE_FIND_ROOT_PATH_MODE_LIBRARY}")
+    endif()
+    set(_qt_saved_suffixes "${CMAKE_FIND_LIBRARY_SUFFIXES}")
+    set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES "${PINK2_DEFAULT_FIND_LIBRARY_SUFFIXES}")
+
     find_package(Qt5 5.12 COMPONENTS ${PINK2_QT_COMPONENTS} REQUIRED)
+
+    set(CMAKE_FIND_LIBRARY_SUFFIXES "${_qt_saved_suffixes}")
+    if(_qt_saved_root_mode_defined)
+        set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY "${_qt_saved_root_mode}")
+    else()
+        unset(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY)
+    endif()
+    unset(_qt_saved_root_mode_defined)
+    unset(_qt_saved_root_mode)
+    unset(_qt_saved_suffixes)
 endif()
 
 
