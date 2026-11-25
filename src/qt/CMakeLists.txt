@@ -322,12 +322,82 @@ if(APPLE)
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/share/qt/Info.plist.cmake.in")
 endif()
 
-# themes: next to the binary (Contents/MacOS in the bundle), as the .pro's
-# INSTALLS puts them.
-add_custom_command(TARGET Pinkcoin-Qt POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_CURRENT_SOURCE_DIR}/res/themes" "$<TARGET_FILE_DIR:Pinkcoin-Qt>/themes"
-    VERBATIM)
+# themes: next to the binary, as the .pro's INSTALLS puts them. Not in the macOS
+# bundle: the .pro puts them in Contents/MacOS, where codesign accepts only code
+# ("code object is not signed at all" on the first .png), no GUI source reads
+# them (bitcoingui.h declares themesDir and never uses it), and 2.4.0.0's DMG did
+# not contain them.
+if(NOT APPLE)
+    add_custom_command(TARGET Pinkcoin-Qt POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_CURRENT_SOURCE_DIR}/res/themes" "$<TARGET_FILE_DIR:Pinkcoin-Qt>/themes"
+        VERBATIM)
+endif()
+
+
+# macOS deploy target
+# ===================
+#
+# cmake --build build --target deploy writes Pinkcoin-macOS-<arch>-<version>.dmg
+# to the build directory: the bundle with the Qt frameworks and plugins and the
+# other libraries it loads copied in and relocated by
+# contrib/macdeploy/macdeployqtplus (Gridcoin's), and code-signed. The signing
+# identity is APPLE_SIGNING_IDENTITY from the environment the target runs in
+# (not passed on the command line: identities contain parentheses); without it
+# the bundle is signed ad hoc. There is no entitlements file, so a real identity
+# signs without the hardened runtime. contrib/devtools/check-macos-bundle.sh then
+# checks the DMG's app against the floor.
+if(APPLE)
+    if(NOT Python3_EXECUTABLE)
+        find_program(Python3_EXECUTABLE NAMES python3)
+    endif()
+    if(NOT Python3_EXECUTABLE)
+        set(Python3_EXECUTABLE "python3")
+    endif()
+
+    # Qt's paths come from the qmake of the Qt this build found. Gridcoin asks
+    # the qtpaths on PATH, which with Qt 5 can belong to another Qt (Homebrew's
+    # Qt 6 links its qtpaths into the prefix's bin; qt@5 is keg-only), and Qt 5's
+    # qtpaths has no --query.
+    get_target_property(_qt_qmake Qt5::qmake IMPORTED_LOCATION)
+    foreach(_qt_query PREFIX PLUGINS TRANSLATIONS)
+        execute_process(COMMAND "${_qt_qmake}" -query QT_INSTALL_${_qt_query}
+            OUTPUT_VARIABLE _qt_install_${_qt_query}
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+    endforeach()
+
+    # The architecture the bundle is for: CMAKE_OSX_ARCHITECTURES when it names
+    # one, otherwise the host's (arm64 or x86_64 on the native runners).
+    list(LENGTH CMAKE_OSX_ARCHITECTURES _osx_arch_count)
+    if(_osx_arch_count EQUAL 1)
+        set(_dmg_arch "${CMAKE_OSX_ARCHITECTURES}")
+    else()
+        set(_dmg_arch "${CMAKE_SYSTEM_PROCESSOR}")
+    endif()
+    set(_dmg_name "Pinkcoin-macOS-${_dmg_arch}-${PINK2_VERSION}")
+
+    # The volume is named Pinkcoin-Qt and holds Pinkcoin-Qt.app, as 2.4.0.0's.
+    set(_deploy_cmd
+        "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/contrib/macdeploy/macdeployqtplus"
+        "$<TARGET_BUNDLE_DIR:Pinkcoin-Qt>" Pinkcoin-Qt
+        -dmg "${_dmg_name}")
+    if(IS_DIRECTORY "${_qt_install_PLUGINS}")
+        list(APPEND _deploy_cmd -plugin-dir "${_qt_install_PLUGINS}")
+    else()
+        message(WARNING "deploy: no Qt plugin directory from ${_qt_qmake}; macdeployqtplus will guess")
+    endif()
+    if(IS_DIRECTORY "${_qt_install_TRANSLATIONS}")
+        list(APPEND _deploy_cmd -translations-dir "${_qt_install_TRANSLATIONS}")
+    endif()
+
+    add_custom_target(deploy
+        COMMAND ${CMAKE_COMMAND} -E env "QTDIR=${_qt_install_PREFIX}" ${_deploy_cmd}
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        COMMENT "Deploying ${_dmg_name}.dmg via macdeployqtplus"
+        VERBATIM)
+    add_dependencies(deploy Pinkcoin-Qt)
+endif()
 
 
 # Tests
