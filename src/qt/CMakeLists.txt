@@ -397,8 +397,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_definitions(Pinkcoin-Qt PRIVATE LINUX)
 endif()
 
-# windows: WIN32 and _MT come with pink2_core_defs.
+# windows: WIN32 and _MT come with pink2_core_defs. UNICODE and _UNICODE are
+# qmake's: its win32-g++ spec (mkspecs/common/g++-win32.conf) defines them for
+# every source, so 2.4.0.0's Pinkcoin-Qt.exe was built with them, core sources
+# included. pink2d, test_pink2 and Berkeley DB stay narrow, as their makefile
+# and 2.4.0.0's BDB built them.
 if(WIN32)
+    target_compile_definitions(Pinkcoin-Qt PRIVATE UNICODE _UNICODE)
     target_link_libraries(Pinkcoin-Qt PRIVATE
         ws2_32 shlwapi mswsock ole32 oleaut32 uuid gdi32)
     target_link_options(Pinkcoin-Qt PRIVATE -Wl,--dynamicbase -Wl,--nxcompat)

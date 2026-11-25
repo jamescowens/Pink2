@@ -266,6 +266,10 @@ if(ENABLE_DAEMON)
         # Static Boost, OpenSSL and miniupnpc; see "macOS: a pink2d without Homebrew".
         set_target_properties(pink2d PROPERTIES PINK2_STATIC_DEPS ON)
     endif()
+    if(WIN32)
+        # ASLR and DEP, as makefile.linux-mingw's LDFLAGS (the GUI's are in src/qt).
+        target_link_options(pink2d PRIVATE -Wl,--dynamicbase -Wl,--nxcompat)
+    endif()
 
     add_test(NAME pink2d_help
         COMMAND ${CMAKE_COMMAND}
