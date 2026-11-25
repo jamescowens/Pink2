@@ -13,6 +13,10 @@ on a Mac, without otool.
 
 bundle  The app bundle the DMG ships (check-macos-bundle.sh calls this). Fails if
         - Contents/Info.plist's LSMinimumSystemVersion is missing or is not FLOOR;
+        - Contents/MacOS/<CFBundleExecutable> is missing or is not a Mach-O
+          file, or CFBundleExecutable is not set;
+        - any Mach-O slice in the bundle records no minimum macOS (its floor
+          cannot be checked, so it is not assumed);
         - any Mach-O slice in the bundle has a minimum macOS above FLOOR (dyld
           refuses to load it there, whatever the plist claims);
         - any load command (LC_ID_DYLIB, the LC_LOAD_* family, LC_RPATH) names an
@@ -302,8 +306,17 @@ def cmd_bundle(app, floor_text):
     if worst_files:
         print("  at the measured floor: %s%s" % (", ".join(worst_files[:5]),
               " (+%d more)" % (len(worst_files) - 5) if len(worst_files) > 5 else ""))
+
+    # The main executable is the one Mach-O the bundle cannot do without, so it
+    # must be there and measured, not merely absent from the problem lists.
+    exe_rel = os.path.join("Contents", "MacOS", exe_name) if isinstance(exe_name, str) and exe_name else None
+    if exe_rel is None:
+        failures.append("Info.plist has no CFBundleExecutable")
+    elif exe_rel not in machos:
+        failures.append("the main executable %s is missing or is not a Mach-O file" % exe_rel)
     if no_minos:
-        print("  no minimum recorded (not measured): %s" % ", ".join(no_minos))
+        failures.append("%d Mach-O slices record no minimum macOS, so their floor cannot be checked:\n      %s"
+                        % (len(no_minos), "\n      ".join(no_minos)))
 
     if measured < 10:
         failures.append("only %d Mach-O slices carry a minimum macOS; this check cannot vouch "
