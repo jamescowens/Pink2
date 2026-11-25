@@ -182,6 +182,10 @@ packages/qt.mk (1ceea's, with these changes)
         lib/cmake/Qt5LinguistTools/*, and the stage step installs only those
         files (install_cmake_linguist_tools_files). Only lrelease, lupdate
         and lconvert are built, as at 1ceea.
+  - mingw32 also builds and installs qtbase's winmain (libqtmain.a), which
+    the 1ceea recipe did not: Qt5Core's CMake package links Qt5::WinMain
+    into every WIN32_EXECUTABLE, so without it Pinkcoin-Qt.exe has no rule
+    for libqtmain.a.
   Everything else (the other configure options, patches, the build of qtbase,
   qtsvg, qttranslations and the three linguist tools) is 1ceea's.
 
