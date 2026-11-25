@@ -1,10 +1,18 @@
 //
-// Unit tests for the fixed proof hashes and the block lock-in
+// Unit tests for the fixed proof hashes, the block lock-in and the Flash hour
 //
 #include <boost/test/unit_test.hpp>
 
+#include <limits>
+#include <stdlib.h>
+#include <time.h>
+#include <string>
+
+#include <boost/random/mersenne_twister.hpp>
+
 #include "../stakeproofs.h"
 #include "../checkpoints.h"
+#include "../main.h"
 #include "../util.h"
 
 using namespace std;
@@ -78,5 +86,90 @@ BOOST_AUTO_TEST_CASE(lockin_testnet_none)
     fTestNet = true;
     BOOST_CHECK(Checkpoints::CheckHardened(3063000, uint256(1)));
 }
+
+#ifndef WIN32
+// The four Flash hours, copied from main.cpp (nHour1..nHour4 are not visible
+// here), with the hour taken from a reference calendar conversion
+static bool FlashHourReference(unsigned int nTime)
+{
+    time_t t = nTime;
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+    int h = tmv.tm_hour;
+    return h == 15 || h == 20 || h == 1 || h == 6;
+}
+
+// Sets TZ=UTC0 for the scope and restores the previous TZ on exit
+struct TzGuard
+{
+    bool fHad;
+    std::string strOld;
+    TzGuard()
+    {
+        const char* p = getenv("TZ");
+        fHad = (p != NULL);
+        if (fHad)
+            strOld = p;
+        setenv("TZ", "UTC0", 1);
+        tzset();
+    }
+    ~TzGuard()
+    {
+        if (fHad)
+            setenv("TZ", strOld.c_str(), 1);
+        else
+            unsetenv("TZ");
+        tzset();
+    }
+};
+
+BOOST_AUTO_TEST_CASE(flash_hour_matches_reference)
+{
+    TzGuard tzGuard;
+
+    // Largest time compared: the top of the 32-bit unsigned range, or
+    // INT32_MAX where time_t is 32 bits
+    const long long nMax = sizeof(time_t) == 4 ? (long long)std::numeric_limits<int32_t>::max() : 4294967295LL;
+
+    // every hour boundary from 2014-01-01 to nMax
+    long long mismatches = 0;
+    long long firstBad = -1;
+    for (long long b = 1388534400LL; b <= nMax; b += 3600)
+    {
+        for (long long t = b - 1; t <= b + 1; t++)
+        {
+            if (t > nMax)
+                continue;
+            if (IsFlashStake((unsigned int)t) != FlashHourReference((unsigned int)t))
+            {
+                if (mismatches == 0)
+                    firstBad = t;
+                mismatches++;
+            }
+        }
+    }
+    if (mismatches)
+        BOOST_TEST_MESSAGE("first boundary mismatch at t=" << firstBad);
+    BOOST_CHECK_EQUAL(mismatches, 0);
+
+    // random times from 0 to nMax
+    boost::random::mt19937 gen(20261124);
+    mismatches = 0;
+    firstBad = -1;
+    for (int i = 0; i < 5000000; i++)
+    {
+        unsigned int t = (unsigned int)(gen() % ((unsigned long long)nMax + 1));
+        if (IsFlashStake(t) != FlashHourReference(t))
+        {
+            if (mismatches == 0)
+                firstBad = t;
+            mismatches++;
+        }
+    }
+    if (mismatches)
+        BOOST_TEST_MESSAGE("first random mismatch at t=" << firstBad);
+    BOOST_CHECK_EQUAL(mismatches, 0);
+}
+#endif
 
 BOOST_AUTO_TEST_SUITE_END()

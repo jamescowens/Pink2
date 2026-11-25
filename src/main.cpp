@@ -1317,15 +1317,10 @@ int GetNumBlocksOfPeers()
 
 bool IsFlashStake(unsigned int nTime)
 {
-
-    time_t rawtime;
-    struct tm * ptm;
-
     bool bIsFlash = false;
 
-    rawtime = nTime;
-    ptm = gmtime ( &rawtime );
-    int nHour = ptm->tm_hour ;
+    // UTC hour of the timestamp
+    int nHour = (nTime % 86400) / 3600;
     switch(nHour)
     {
         case nHour1:
