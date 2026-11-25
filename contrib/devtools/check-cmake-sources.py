@@ -18,8 +18,9 @@ Rules for the GUI comparison:
     (windows:, macx:, win32:, contains(...) ...) and is excluded from both sides, with one
     exception: the contains(USE_QRCODE, 1) block counts as expected exactly when the build's
     ENABLE_QRENCODE cache entry is ON.
-  * Headers, generated files (moc_*, qrc_*, ui_*, build.h, the processed qrc) and anything
-    outside the source tree are ignored; only .cpp/.S sources and .ui forms are compared.
+  * Headers, generated files (moc_*, qrc_*, ui_*, build.h, the processed qrc, and anything else
+    in the build tree, such as the static Qt plugin import file) and anything outside the source
+    tree are ignored; only .cpp/.S sources and .ui forms are compared.
   * Platform-only CMake sources (.mm, .rc) are ignored for the same reason as the scoped .pro
     entries.
 
@@ -76,13 +77,20 @@ def ensure_reply(build_dir, reply_dir):
     return r
 
 
-def cmake_sources(target, srcdir):
+def cmake_sources(target, srcdir, builddir):
     """Set of source-tree-relative .cpp/.S/.ui paths of a target, generated files excluded."""
     out = set()
+    # The build tree, unless it is the source tree itself (an in-source build).
+    builddir = os.path.realpath(builddir)
+    if builddir == os.path.realpath(srcdir):
+        builddir = None
     for s in target.get('sources', []):
         if s.get('isGenerated'):
             continue
         p = s['path']
+        full = os.path.realpath(p if os.path.isabs(p) else os.path.join(srcdir, p))
+        if builddir and full.startswith(builddir + os.sep):
+            continue
         if os.path.isabs(p):
             if not p.startswith(srcdir + os.sep):
                 continue
@@ -192,22 +200,23 @@ def main():
     for need in ('pink2_core', 'pink2d'):
         if need not in targets:
             die('target %s missing (daemon build not configured)' % need)
-    new = cmake_sources(targets['pink2_core'], srcdir) | cmake_sources(targets['pink2d'], srcdir)
+    new = (cmake_sources(targets['pink2_core'], srcdir, build)
+           | cmake_sources(targets['pink2d'], srcdir, build))
     drift |= compare('daemon', makefile_objs(srcdir), new, 'makefile.unix', 'CMake pink2d+pink2_core')
 
     if 'test_pink2' in targets:
         old = set('src/test/' + os.path.basename(f) for f in
                   glob.glob(os.path.join(srcdir, 'src', 'test', '*.cpp')))
         old.add('src/noui.cpp')
-        drift |= compare('tests', old, cmake_sources(targets['test_pink2'], srcdir),
+        drift |= compare('tests', old, cmake_sources(targets['test_pink2'], srcdir, build),
                          'src/test + noui.cpp', 'CMake test_pink2')
     else:
         print('tests: test_pink2 not configured, skipped')
 
     if 'Pinkcoin-Qt' in targets:
-        new = cmake_sources(targets['Pinkcoin-Qt'], srcdir)
+        new = cmake_sources(targets['Pinkcoin-Qt'], srcdir, build)
         for lib in linked_in_tree(targets, 'Pinkcoin-Qt'):
-            new |= cmake_sources(targets[lib], srcdir)
+            new |= cmake_sources(targets[lib], srcdir, build)
         old = pro_sources(srcdir, cache_value(build, 'ENABLE_QRENCODE'))
         drift |= compare('gui', old, new, 'pinkcoin-qt.pro', 'CMake Pinkcoin-Qt')
     else:
