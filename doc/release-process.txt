@@ -16,6 +16,18 @@
 
 * release builds are made by the GitHub Actions workflow in .github/workflows/cmake_production.yml
 
+* Release gate: before publishing the draft release, compare the tag build's
+  Linux pink2d with the binary that passed the release gate. The Linux job's
+  summary gives the sha256 of the pink2d in Pinkcoin-Linux-<version>.tar.xz
+  and of its .text section. Compute the gated binary's the same way:
+
+    objcopy -O binary --only-section=.text pink2d pink2d.text
+    sha256sum pink2d.text
+
+  The commit id and date in the version string are not in .text, so the tag
+  build of the gated code gives the same .text hash. If the hashes differ,
+  gate the tag build's pink2d again before publishing.
+
 * perform Mac build
   See this blog post for how Gavin set up his build environment to build the OSX
   release; note that a patched version of macdeployqt is not needed anymore, as
