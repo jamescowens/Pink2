@@ -2,7 +2,7 @@
 Pinkcoin 2 development tree
 ===========================
 
-[![CircleCI](https://circleci.com/gh/Pink2Dev/Pink2.svg?style=svg)](https://circleci.com/gh/Pink2Dev/Pink2)
+Release builds are produced by the GitHub Actions workflow in `.github/workflows/cmake_production.yml`.
 
 What is Pinkcoin?
 -----------------
