@@ -1,9 +1,10 @@
 //
-// Unit tests for the fixed proof hashes
+// Unit tests for the fixed proof hashes and the block lock-in
 //
 #include <boost/test/unit_test.hpp>
 
 #include "../stakeproofs.h"
+#include "../checkpoints.h"
 #include "../util.h"
 
 using namespace std;
@@ -48,6 +49,34 @@ BOOST_AUTO_TEST_CASE(listed_proofs_testnet_empty)
     BOOST_CHECK(GetFixedStakeProof(uint256("0x092cf20219a5f559a239715916d6f482a72154ec0faaa0090d57ee06bbeb56d6")) == NULL);
     BOOST_CHECK(GetFixedStakeProof(uint256("0xb10d687919a15c8b818d4175b596cad18cb39641536f08280f90db143560d082")) == NULL);
     BOOST_CHECK(GetFixedStakeProof(uint256("0xb9818366d52751455db68f488b7636a7f804d1ce368b3b5e9c8945a1dc68e51e")) == NULL);
+}
+
+BOOST_AUTO_TEST_CASE(lockin_main_hash)
+{
+    TestNetGuard guard;
+    fTestNet = false;
+    BOOST_CHECK(Checkpoints::CheckHardened(3063000, uint256("0xd86b8cf55ed4ef9bfbebb6edf12dbec3914552d59b32f32dd52d339fd966e341")));
+}
+
+BOOST_AUTO_TEST_CASE(lockin_other_hash)
+{
+    TestNetGuard guard;
+    fTestNet = false;
+    BOOST_CHECK(!Checkpoints::CheckHardened(3063000, uint256(1)));
+}
+
+BOOST_AUTO_TEST_CASE(lockin_estimate_unchanged)
+{
+    TestNetGuard guard;
+    fTestNet = false;
+    BOOST_CHECK_EQUAL(Checkpoints::GetTotalBlocksEstimate(), 728000);
+}
+
+BOOST_AUTO_TEST_CASE(lockin_testnet_none)
+{
+    TestNetGuard guard;
+    fTestNet = true;
+    BOOST_CHECK(Checkpoints::CheckHardened(3063000, uint256(1)));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
