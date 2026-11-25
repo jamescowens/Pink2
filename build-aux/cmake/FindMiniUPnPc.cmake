@@ -45,16 +45,97 @@ set(_MINIUPNPC_SEARCH_PATHS
     /opt/local
 )
 
-# Find header
+# miniupnpc's own CMake package first, where one is installed: its CMake build
+# installs it, so depends has one (Homebrew's keg has none, only a .pc). It
+# knows the library's file name, which the search below has to guess: on
+# Windows its static archive is OUTPUT_NAME libminiupnpc, so liblibminiupnpc.a.
+#
+# Only the file and the include directory are taken from it, into the target
+# below. Its own target carries MINIUPNP_STATICLIB on every platform, which
+# makefile.unix never defines (the Windows build adds it in src/CMakeLists.txt),
+# and the macOS pink2d needs an UNKNOWN target with a location to find its
+# static twin by. pkg-config is not used for the same reason: its imported
+# target is an INTERFACE library with no location.
+#
+# MINIUPNPC_USE_STATIC_LIBS is left as the caller set it. Unset, the package
+# loads whichever export it has (the shared one if both), and never fails: set
+# with no static export installed (openSUSE ships the shared one only), its
+# miniupnpc-config.cmake includes a file that does not exist. A result of the
+# wrong kind for STATIC_LIBS is not taken; the search below then decides.
+if(NOT MiniUPnPc_LIBRARY OR NOT MiniUPnPc_INCLUDE_DIR)
+    find_package(miniupnpc CONFIG QUIET HINTS ${MINIUPNPC_ROOT})
+
+    set(_miniupnpc_target miniupnpc::miniupnpc)
+    if(TARGET ${_miniupnpc_target})
+        get_target_property(_miniupnpc_aliased ${_miniupnpc_target} ALIASED_TARGET)
+        if(_miniupnpc_aliased)
+            set(_miniupnpc_target ${_miniupnpc_aliased})
+        endif()
+        get_target_property(_miniupnpc_type ${_miniupnpc_target} TYPE)
+
+        # The file to link: the archive, or for a shared library its import
+        # library where there is one (Windows), else the library itself.
+        set(_miniupnpc_location "")
+        if(_miniupnpc_type MATCHES "^(STATIC|SHARED|UNKNOWN)_LIBRARY$")
+            get_target_property(_miniupnpc_configs ${_miniupnpc_target} IMPORTED_CONFIGURATIONS)
+            if(NOT _miniupnpc_configs)
+                set(_miniupnpc_configs "")
+            endif()
+            foreach(_miniupnpc_config RELEASE NOCONFIG ${_miniupnpc_configs} "")
+                if(_miniupnpc_config)
+                    string(TOUPPER "_${_miniupnpc_config}" _miniupnpc_config)
+                endif()
+                foreach(_miniupnpc_property IMPORTED_IMPLIB IMPORTED_LOCATION)
+                    get_target_property(_miniupnpc_location ${_miniupnpc_target}
+                        ${_miniupnpc_property}${_miniupnpc_config})
+                    if(_miniupnpc_location AND EXISTS "${_miniupnpc_location}")
+                        break()
+                    endif()
+                    set(_miniupnpc_location "")
+                endforeach()
+                if(_miniupnpc_location)
+                    break()
+                endif()
+            endforeach()
+        endif()
+        if(_miniupnpc_location AND STATIC_LIBS)
+            get_filename_component(_miniupnpc_ext "${_miniupnpc_location}" LAST_EXT)
+            if(NOT _miniupnpc_type STREQUAL "STATIC_LIBRARY"
+               OR NOT _miniupnpc_ext STREQUAL CMAKE_STATIC_LIBRARY_SUFFIX)
+                message(STATUS "miniupnpc: ${miniupnpc_DIR} offers ${_miniupnpc_location} "
+                    "(${_miniupnpc_type}); STATIC_LIBS wants an archive, so searching for one")
+                set(_miniupnpc_location "")
+            endif()
+        endif()
+
+        # The directory that holds miniupnpc/miniupnpc.h, as src/net.cpp
+        # includes it.
+        get_target_property(_miniupnpc_includes ${_miniupnpc_target} INTERFACE_INCLUDE_DIRECTORIES)
+        set(_miniupnpc_include "")
+        foreach(_miniupnpc_dir IN LISTS _miniupnpc_includes)
+            if(EXISTS "${_miniupnpc_dir}/miniupnpc/miniupnpc.h")
+                set(_miniupnpc_include "${_miniupnpc_dir}")
+                break()
+            endif()
+        endforeach()
+
+        if(_miniupnpc_location AND _miniupnpc_include)
+            set(MiniUPnPc_LIBRARY "${_miniupnpc_location}" CACHE FILEPATH "miniupnpc library" FORCE)
+            set(MiniUPnPc_INCLUDE_DIR "${_miniupnpc_include}" CACHE PATH "miniupnpc include directory" FORCE)
+        endif()
+    endif()
+endif()
+
+# Otherwise search for the header and the library. "libminiupnpc" is the
+# Windows file name of miniupnpc's own CMake build (see above).
 find_path(MiniUPnPc_INCLUDE_DIR
     NAMES miniupnpc/miniupnpc.h miniupnpc.h
     HINTS ${_MINIUPNPC_SEARCH_PATHS}
     PATH_SUFFIXES include
 )
 
-# Find library
 find_library(MiniUPnPc_LIBRARY
-    NAMES miniupnpc
+    NAMES miniupnpc libminiupnpc
     HINTS ${_MINIUPNPC_SEARCH_PATHS}
     PATH_SUFFIXES lib lib64
 )
