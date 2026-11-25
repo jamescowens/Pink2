@@ -45,6 +45,14 @@ namespace Checkpoints
         (728000, uint256("0x00000000002984a1ea9ce4967fca19765a55724234e8479a7f7644c22ee5b30c"))
     ;
 
+    // Lock-in table, mainnet only. Read by CheckHardened and nothing else: it
+    // is not part of the checkpoint estimate, the last checkpoint or the
+    // sync-checkpoint logic.
+    static const MapCheckpoints mapLockIn =
+        boost::assign::map_list_of
+        (3063000, uint256("0xd86b8cf55ed4ef9bfbebb6edf12dbec3914552d59b32f32dd52d339fd966e341"))
+    ;
+
     // TestNet has no checkpoints
     static MapCheckpoints mapCheckpointsTestnet =
         boost::assign::map_list_of
@@ -78,8 +86,14 @@ namespace Checkpoints
         MapCheckpoints& checkpoints = (fTestNet ? mapCheckpointsTestnet : mapCheckpoints);
 
         MapCheckpoints::const_iterator i = checkpoints.find(nHeight);
-        if (i == checkpoints.end()) return true;
-        return hash == i->second;
+        if (i != checkpoints.end() && hash != i->second) return false;
+
+        if (!fTestNet)
+        {
+            i = mapLockIn.find(nHeight);
+            if (i != mapLockIn.end() && hash != i->second) return false;
+        }
+        return true;
     }
 
     int GetTotalBlocksEstimate()

@@ -12,6 +12,7 @@
 #include "init.h"
 #include "ui_interface.h"
 #include "kernel.h"
+#include "stakeproofs.h"
 #include "smessage.h"
 #include "time.h"
 #include <boost/algorithm/string/replace.hpp>
@@ -1316,15 +1317,10 @@ int GetNumBlocksOfPeers()
 
 bool IsFlashStake(unsigned int nTime)
 {
-
-    time_t rawtime;
-    struct tm * ptm;
-
     bool bIsFlash = false;
 
-    rawtime = nTime;
-    ptm = gmtime ( &rawtime );
-    int nHour = ptm->tm_hour ;
+    // UTC hour of the timestamp
+    int nHour = (nTime % 86400) / 3600;
     switch(nHour)
     {
         case nHour1:
@@ -2342,6 +2338,12 @@ bool CBlock::AcceptBlock()
         {
             printf("WARNING: AcceptBlock(): check proof-of-stake failed for block %s\n", hash.ToString().c_str());
             return false; // do not error here as we expect this during initial block download
+        }
+        if (const uint256* p = GetFixedStakeProof(hash))
+        {
+            if (fDebug)
+                printf("AcceptBlock() : block %s: proof hash %s\n", hash.ToString().c_str(), p->ToString().c_str());
+            hashProof = *p;
         }
     }
     // PoW is checked in CheckBlock()
