@@ -193,3 +193,7 @@ if(ENABLE_DAEMON)
             -DPINK2_VERSION=${PINK2_VERSION}
             -P "${CMAKE_SOURCE_DIR}/build-aux/cmake/tests/check_help.cmake")
 endif()
+
+if(ENABLE_TESTS)
+    add_subdirectory(test)
+endif()
