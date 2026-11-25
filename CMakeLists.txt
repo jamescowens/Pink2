@@ -257,11 +257,19 @@ endif()
 # check_pie_supported() has to run for CMake to honour POSITION_INDEPENDENT_CODE on
 # executables in both directions: ENABLE_PIE=OFF then emits -no-pie, and does not
 # leave the toolchain's default.
+#
+# Except on Apple, where ENABLE_PIE=OFF leaves POSITION_INDEPENDENT_CODE unset, so
+# CMake adds neither flag and the linker's default, PIE, stands. Apple's ld
+# deprecates -no_pie but on x86_64 still honours it, which takes ASLR away from
+# the executables. makefile.osx passes no PIE flag, and 2.4.0.0's macOS binaries
+# are PIE.
 check_pie_supported()
 if(ENABLE_PIE AND NOT CMAKE_CXX_LINK_PIE_SUPPORTED)
     message(FATAL_ERROR "PIE is not supported by the current linker")
 endif()
-set(CMAKE_POSITION_INDEPENDENT_CODE ${ENABLE_PIE})
+if(ENABLE_PIE OR NOT APPLE)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ${ENABLE_PIE})
+endif()
 
 if(ENABLE_HARDENING)
     string(FIND "${CMAKE_CXX_FLAGS}" "-fsanitize" _hardening_sanitizer_pos)
