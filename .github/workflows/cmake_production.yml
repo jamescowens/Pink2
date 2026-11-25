@@ -23,7 +23,7 @@
 # check-build-warnings.sh). Gridcoin's inline hermeticity and DMG checks are
 # contrib/devtools scripts here, and so is the binary hardening check. Every
 # platform starts the programs it ships (.github/scripts/smoke.sh), GUI
-# included.
+# included, and the draft release is made with the runner's gh CLI.
 
 name: CMake Production Builds
 
@@ -946,11 +946,19 @@ jobs:
       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
       (github.event_name == 'workflow_dispatch' && inputs.dry_run_release)
     runs-on: ubuntu-latest
+    # One run per tag at a time, and none cancelled: two runs of one tag could
+    # otherwise both pass the existing-release check below.
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
-      # For src/clientversion.h, the version every asset is named for.
+      # For src/clientversion.h, the version every asset is named for. No
+      # credentials are left in .git; nothing in this job pushes.
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Download All Artifacts
         uses: actions/download-artifact@v5
@@ -1020,14 +1028,37 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # With the runner's gh CLI. A release that already exists for the tag,
+      # draft or published (gh finds a draft by its pending tag), stops the
+      # run: a re-run must neither add a second draft nor replace the first
+      # one's files. Delete it to publish again. --verify-tag: the tag must
+      # already be on GitHub, which a push of it means; gh never creates one.
+      # The draft's notes are SHA256SUMS and a pointer to the release gate; the
+      # real notes are written before it is published.
       - name: Publish Draft Release
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: release_assets/*
-          draft: true
-          generate_release_notes: true
-          fail_on_unmatched_files: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if existing=$(gh release view "$GITHUB_REF_NAME" --json tagName,isDraft,url 2>&1); then
+            echo "::error::a release for $GITHUB_REF_NAME already exists: $existing. Delete it to publish again."
+            exit 1
+          elif [[ "$existing" != *"release not found"* ]]; then
+            echo "::error::could not check for an existing release of $GITHUB_REF_NAME: $existing"
+            exit 1
+          fi
+          notes="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "Draft for $GITHUB_REF_NAME ($GITHUB_SHA), from workflow run $GITHUB_RUN_ID."
+            echo "Before publishing: the release gate in doc/release-process.txt, and the release notes."
+            echo
+            echo '```'
+            cat release_assets/SHA256SUMS
+            echo '```'
+          } > "$notes"
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+            --title "$GITHUB_REF_NAME" --notes-file "$notes" release_assets/*
 
       # The dry run's result: the seven files a release would carry. Kept longer
       # than the build artifacts, since it can be the release gate's input.
