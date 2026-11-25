@@ -19,6 +19,68 @@ foreach(_part MAJOR MINOR REVISION BUILD)
 endforeach()
 set(PINK2_VERSION "${CLIENT_VERSION_MAJOR}.${CLIENT_VERSION_MINOR}.${CLIENT_VERSION_REVISION}.${CLIENT_VERSION_BUILD}")
 
+# The macOS floor
+# ===============
+
+# Set before project(), which is when CMake reads it.
+#
+# share/qt/Info.plist.cmake.in substitutes it into LSMinimumSystemVersion, so
+# without a default here every build that does not pass
+# -DCMAKE_OSX_DEPLOYMENT_TARGET would stamp the bundle with an empty minimum.
+# The Intel CI job uses this default; the Apple Silicon job passes 15.0.
+#
+# FORCE is required, not tidiness. On macOS, CMake's own
+# Platform/Darwin-Initialize.cmake unconditionally caches this variable (empty
+# when MACOSX_DEPLOYMENT_TARGET is unset), so a plain `set(... CACHE ...)` is a
+# no-op whenever an entry exists. An explicitly empty -DCMAKE_OSX_DEPLOYMENT_TARGET=
+# is covered by the same FORCE. An explicit non-empty -D still wins, because then
+# the guard fails.
+#
+# The toolchain guard keeps this out of depends cross-builds, which declare their
+# own floor and bake it into their compile and link flags; applying this default
+# there would put two contradictory version-min specs on the same lines.
+#
+# 14.0 is the floor of the Intel dependency stack. The Apple Silicon job declares
+# 15.0 (-DCMAKE_OSX_DEPLOYMENT_TARGET=15.0).
+#
+# The default is never above the Mac doing the build: built for 14.0 on macOS 12,
+# a bundle would not launch on the machine that built it. A Mac older than macOS
+# 14 gets its own version (the major version from macOS 11 on, 10.x before), with
+# a warning. CMAKE_HOST_APPLE is set this early but CMAKE_HOST_SYSTEM_VERSION is
+# not, hence sw_vers. A MACOSX_DEPLOYMENT_TARGET in the environment is used as
+# given, ahead of this default; only an explicit -D comes before it.
+if(NOT CMAKE_TOOLCHAIN_FILE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(_macos_floor "14.0")
+    if(NOT "$ENV{MACOSX_DEPLOYMENT_TARGET}" STREQUAL "")
+        set(_macos_floor "$ENV{MACOSX_DEPLOYMENT_TARGET}")
+    elseif(CMAKE_HOST_APPLE)
+        execute_process(COMMAND sw_vers -productVersion
+            OUTPUT_VARIABLE _macos_host_version
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE _macos_sw_vers_status
+            ERROR_QUIET)
+        if(_macos_sw_vers_status EQUAL 0 AND _macos_host_version MATCHES "^(10\\.[0-9]+|[0-9]+)")
+            set(_macos_host_floor "${CMAKE_MATCH_1}")
+            if(NOT _macos_host_floor MATCHES "\\.")
+                string(APPEND _macos_host_floor ".0")
+            endif()
+            if(_macos_host_floor VERSION_LESS _macos_floor)
+                set(_macos_floor "${_macos_host_floor}")
+                message(WARNING "This Mac runs macOS ${_macos_host_version}, so the build targets "
+                    "macOS ${_macos_floor} instead of 14.0, and the app will need macOS "
+                    "${_macos_floor} or newer. Releases require macOS 14 (Intel) or 15 (Apple "
+                    "Silicon). Pass -DCMAKE_OSX_DEPLOYMENT_TARGET=<version>, or set "
+                    "MACOSX_DEPLOYMENT_TARGET, to choose the target yourself.")
+            endif()
+        endif()
+    endif()
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "${_macos_floor}" CACHE STRING "Minimum macOS version (ignored off Apple platforms)" FORCE)
+    unset(_macos_floor)
+    unset(_macos_host_version)
+    unset(_macos_host_floor)
+    unset(_macos_sw_vers_status)
+endif()
+
 project(Pinkcoin
     VERSION ${PINK2_VERSION}
     DESCRIPTION "Pinkcoin, a proof-of-stake cryptocurrency"
