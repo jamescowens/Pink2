@@ -81,10 +81,186 @@ else()
 endif()
 
 
+# Dependencies
+# ============
+
+include(CheckCXXCompilerFlag)
+include(CheckLinkerFlag)
+include(CheckPIESupported)
+
+# Static linking must be set up before the dependencies are searched for.
+if(STATIC_LIBS)
+    set(CMAKE_LINK_SEARCH_START_STATIC ON)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES "${CMAKE_STATIC_LIBRARY_SUFFIX}")
+    set(Boost_USE_STATIC_LIBS ON)
+    set(OPENSSL_USE_STATIC_LIBS TRUE)
+    set(ZLIB_USE_STATIC_LIBS ON)
+endif()
+
+if(STATIC_RUNTIME AND CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang)$")
+    set(PINK2_RUNTIME_LIBS -static-libgcc -static-libstdc++)
+endif()
+
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
+# CMake 3.30 deprecates the module-mode FindBoost; it is only used for Boost
+# older than 1.70.
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.30)
+    cmake_policy(SET CMP0167 OLD)
+endif()
+if(NOT DEFINED Boost_USE_DEBUG_RUNTIME)
+    set(Boost_USE_DEBUG_RUNTIME OFF)
+endif()
+
+# The components the makefiles link. system is header-only from Boost 1.69, and
+# Boost 1.90 no longer builds the library.
+set(BOOST_MINIMUM_VERSION 1.66.0)
+set(BOOST_COMPONENTS filesystem program_options thread chrono)
+find_package(Boost ${BOOST_MINIMUM_VERSION} REQUIRED)
+if(Boost_VERSION VERSION_LESS 1.69.0)
+    list(APPEND BOOST_COMPONENTS system)
+endif()
+if(Boost_VERSION VERSION_LESS 1.70.0)
+    find_package(Boost ${BOOST_MINIMUM_VERSION} COMPONENTS ${BOOST_COMPONENTS} REQUIRED)
+else()
+    find_package(Boost ${BOOST_MINIMUM_VERSION} COMPONENTS ${BOOST_COMPONENTS} CONFIG REQUIRED)
+endif()
+
+# Boost's CMake package puts BOOST_<LIB>_DYN_LINK and BOOST_<LIB>_NO_LIB on its
+# targets. The makefiles define neither, and they only matter to the Windows
+# DLL and auto-link machinery, so they are taken off to keep the define set the
+# same as the old build's (contrib/devtools/compare-defines.sh checks that).
+function(pink2_strip_boost_link_defines)
+    set(_todo ${ARGN})
+    set(_seen "")
+    while(_todo)
+        list(POP_FRONT _todo _t)
+        if(NOT TARGET ${_t} OR ${_t} IN_LIST _seen)
+            continue()
+        endif()
+        list(APPEND _seen ${_t})
+        get_target_property(_defs ${_t} INTERFACE_COMPILE_DEFINITIONS)
+        if(_defs)
+            list(FILTER _defs EXCLUDE REGEX "^BOOST_[A-Z0-9_]+_(DYN_LINK|NO_LIB)$")
+            set_property(TARGET ${_t} PROPERTY INTERFACE_COMPILE_DEFINITIONS "${_defs}")
+        endif()
+        get_target_property(_libs ${_t} INTERFACE_LINK_LIBRARIES)
+        if(_libs)
+            foreach(_l IN LISTS _libs)
+                if(_l MATCHES "^Boost::")
+                    list(APPEND _todo ${_l})
+                endif()
+            endforeach()
+        endif()
+    endwhile()
+endfunction()
+set(_boost_targets Boost::headers)
+foreach(_c IN LISTS BOOST_COMPONENTS)
+    list(APPEND _boost_targets Boost::${_c})
+endforeach()
+pink2_strip_boost_link_defines(${_boost_targets})
+
+find_package(OpenSSL REQUIRED)
+find_package(ZLIB REQUIRED)
+
+if(ENABLE_UPNP)
+    find_package(MiniUPnPc REQUIRED)
+endif()
+
+# Only the GUI draws QR codes.
+if(ENABLE_GUI AND ENABLE_QRENCODE)
+    find_package(QREncode REQUIRED)
+endif()
+
+
+# Hardening and PIE
+# =================
+
+# makefile.unix's HARDENING is -fstack-protector-all -Wstack-protector
+# -D_FORTIFY_SOURCE=2 (with the PIE flags when asked), and -Wl,-z,relro -Wl,-z,now
+# at link time. This set is Gridcoin's, which contains all of those, probed before
+# use; it adds the CET and branch-protection flags and noexecstack/separate-code.
+#
+# check_pie_supported() has to run for CMake to honour POSITION_INDEPENDENT_CODE on
+# executables in both directions: ENABLE_PIE=OFF then emits -no-pie, and does not
+# leave the toolchain's default.
+check_pie_supported()
+if(ENABLE_PIE AND NOT CMAKE_CXX_LINK_PIE_SUPPORTED)
+    message(FATAL_ERROR "PIE is not supported by the current linker")
+endif()
+set(CMAKE_POSITION_INDEPENDENT_CODE ${ENABLE_PIE})
+
+if(ENABLE_HARDENING)
+    string(FIND "${CMAKE_CXX_FLAGS}" "-fsanitize" _hardening_sanitizer_pos)
+    if(_hardening_sanitizer_pos EQUAL -1)
+        # _FORTIFY_SOURCE needs optimisation. A value already in
+        # CMAKE_<LANG>_FLAGS is the packager's, and stands for that language.
+        if(CMAKE_BUILD_TYPE OR CMAKE_CONFIGURATION_TYPES)
+            set(_hardening_fortify_when "$<NOT:$<CONFIG:Debug>>")
+            foreach(_hardening_lang C CXX)
+                string(FIND "${CMAKE_${_hardening_lang}_FLAGS}" "_FORTIFY_SOURCE" _hardening_fortify_pos)
+                if(NOT _hardening_fortify_pos EQUAL -1)
+                    string(APPEND _hardening_fortify_when ",$<NOT:$<COMPILE_LANGUAGE:${_hardening_lang}>>")
+                    message(STATUS "Hardening: _FORTIFY_SOURCE left as CMAKE_${_hardening_lang}_FLAGS set it")
+                endif()
+            endforeach()
+            add_compile_options(
+                "$<$<AND:${_hardening_fortify_when}>:-U_FORTIFY_SOURCE>"
+                "$<$<AND:${_hardening_fortify_when}>:-D_FORTIFY_SOURCE=2>")
+        else()
+            message(STATUS "Hardening: _FORTIFY_SOURCE skipped (no build type, so no optimisation)")
+        endif()
+    else()
+        message(STATUS "Hardening: _FORTIFY_SOURCE skipped (sanitizer build)")
+    endif()
+
+    set(hardening_flags -fstack-protector-all -Wstack-protector -fcf-protection=full)
+    # Withheld from Mach-O as Gridcoin does: -mbranch-protection=standard breaks
+    # unwinding on plain arm64, and -fstack-clash-protection is ignored there.
+    if(NOT APPLE)
+        list(APPEND hardening_flags -fstack-clash-protection -mbranch-protection=standard)
+    endif()
+
+    # Make a probe reject a flag the driver accepts and then ignores.
+    check_cxx_compiler_flag("-Werror=unused-command-line-argument" HARDENING_HAVE_WERROR_UNUSED_ARG)
+    set(_hardening_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
+    if(HARDENING_HAVE_WERROR_UNUSED_ARG)
+        string(APPEND CMAKE_REQUIRED_FLAGS " -Werror=unused-command-line-argument")
+    endif()
+    foreach(flag ${hardening_flags})
+        string(MAKE_C_IDENTIFIER "HARDENING_CXX${flag}" flag_var)
+        check_cxx_compiler_flag("${flag}" ${flag_var})
+        if(${flag_var})
+            add_compile_options("${flag}")
+        else()
+            message(STATUS "Hardening: ${flag} not applied (not supported on this target)")
+        endif()
+    endforeach()
+    set(CMAKE_REQUIRED_FLAGS "${_hardening_saved_required_flags}")
+    unset(_hardening_saved_required_flags)
+
+    foreach(flag -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack -Wl,-z,separate-code)
+        string(MAKE_C_IDENTIFIER "HARDENING_LD${flag}" flag_var)
+        check_linker_flag(CXX "${flag}" ${flag_var})
+        if(${flag_var})
+            add_link_options("${flag}")
+        endif()
+    endforeach()
+endif()
+
+
+# Sources
+# =======
+
+# Before add_subdirectory, so the tests registered there count.
+enable_testing()
+
+add_subdirectory(src)
+
+
 # Tests
 # =====
-
-enable_testing()
 
 if(ENABLE_TESTS)
     find_package(Threads REQUIRED)
