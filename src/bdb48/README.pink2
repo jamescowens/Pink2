@@ -48,5 +48,9 @@ builtins in current GCC and Clang, so they are now __atomic_compare_exchange_db
 and atomic_init_db. This is the recipe of .github/scripts/build-bdb48.sh in the
 compat CI. Nothing else in the tree is modified.
 
-The 2010 config.guess and config.sub do not know arm64 macOS. Builds on such a
-host pass --host explicitly (CMAKE_C_COMPILER_TARGET) or replace the two files.
+Host triple: a native build passes no --host, and the 2009 config.guess and
+config.sub need no update for arm64 macOS. config.guess names the processor
+from `uname -p`, which there is "arm", and so reports arm-apple-darwin<release>,
+a triple config.sub accepts; the macOS arm64 CI build configures BDB this way.
+Only a cross build (CMAKE_CROSSCOMPILING) passes --host, taken from
+CMAKE_C_COMPILER_TARGET or else the compiler's -dumpmachine.
