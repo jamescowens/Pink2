@@ -20,8 +20,10 @@
 # Qt 6, the DMG venv (ds_store/mac_alias), the notarization step (it needs a
 # Developer ID and the hardened runtime, which Pink2's bundle has neither of),
 # and the steps for tools Pink2 does not have (install_dependencies.sh,
-# check-build-warnings.sh, check-binary-hardening.sh). Gridcoin's inline
-# hermeticity and DMG checks are contrib/devtools scripts here.
+# check-build-warnings.sh). Gridcoin's inline hermeticity and DMG checks are
+# contrib/devtools scripts here, and so is the binary hardening check. Every
+# platform starts the programs it ships (.github/scripts/smoke.sh), GUI
+# included.
 
 name: CMake Production Builds
 
@@ -99,8 +101,9 @@ jobs:
           sudo apt-get update
           # What depends needs from the host: a compiler and make, autoreconf
           # (qrencode), patch, Python (xcb-proto) and curl. CMake is the image's.
-          # Nothing else: every library comes from depends, and a host -dev
-          # package is one more thing Qt's configure could pick up.
+          # Every library the build links comes from depends: a host -dev
+          # package is one more thing Qt's configure could pick up. The Windows
+          # job also installs wine (below), only to run its tests.
           sudo apt-get install -y --no-install-recommends \
             build-essential autoconf automake libtool pkg-config bison patch \
             python3 curl xz-utils
@@ -118,6 +121,11 @@ jobs:
               fi
               sudo update-alternatives --set "x86_64-w64-mingw32-${tool}" "$posix"
             done
+
+            # wine runs the Windows tests and the smoke test.
+            sudo dpkg --add-architecture i386
+            sudo apt-get update
+            sudo apt-get install -y wine-stable wine64 wine32
           fi
 
       - name: Toolchain versions
@@ -129,6 +137,7 @@ jobs:
             x86_64-w64-mingw32-g++ --version | sed -n 1p
             # Fails unless the alternative above took.
             x86_64-w64-mingw32-g++ -v 2>&1 | grep 'Thread model: posix'
+            wine --version
           fi
 
       # 2. Setup Concurrency
@@ -236,13 +245,15 @@ jobs:
           contrib/devtools/check-hermetic.sh ${{ matrix.build_dir }}/bin/pink2d ${{ matrix.build_dir }}/bin/test_pink2
           contrib/devtools/check-hermetic.sh --gui ${{ matrix.build_dir }}/bin/Pinkcoin-Qt
 
+      # Informational, no gate: one line per program, the GUI's included (on
+      # 22.04 the GUI's is GLIBC_2.35, through hypot; pink2d's is lower).
       - name: Record the glibc Floor (Linux)
         if: contains(matrix.host, 'linux')
         run: |
           floor=$(contrib/devtools/glibc-floor.sh ${{ matrix.build_dir }}/bin/pink2d ${{ matrix.build_dir }}/bin/Pinkcoin-Qt)
           echo "$floor"
           {
-            echo "### Linux glibc floor (built with $(ldd --version | sed -n 1p))"
+            echo "### Linux glibc floor of pink2d and Pinkcoin-Qt (built with $(ldd --version | sed -n 1p))"
             echo '```'
             echo "$floor"
             echo '```'
@@ -258,28 +269,56 @@ jobs:
         timeout-minutes: 45
         run: ctest --test-dir ${{ matrix.build_dir }} --output-on-failure --timeout 1800
 
-      # Testnet, networking off (-connect=0 -listen=0 -upnp=0 -staking=0),
-      # throwaway data directory: RPC up, getinfo, stop, and the -rpcallowip
-      # listener.
-      - name: Smoke Test (Linux)
-        if: contains(matrix.host, 'linux')
-        run: .github/scripts/smoke.sh ${{ matrix.build_dir }}/bin/pink2d
+      # 9. Test (Windows)
+      # Under wine, set up as in Gridcoin's "Run Tests (Windows)". Not through
+      # ctest with CMAKE_CROSSCOMPILING_EMULATOR: pink2d_help runs pink2d.exe
+      # from a CMake script, which bypasses the emulator. So the two test
+      # programs run directly, each bounded as ctest --timeout would; the smoke
+      # test below starts pink2d.exe and Pinkcoin-Qt.exe.
+      - name: Run Tests (Windows)
+        if: contains(matrix.host, 'mingw')
+        env:
+          WINEDLLOVERRIDES: "mscoree,mshtml="
+          WINEARCH: win64
+        timeout-minutes: 45
+        run: |
+          wineboot --init || true
+          timeout 1800 wine ${{ matrix.build_dir }}/bdb48_smoke.exe
+          timeout 1800 wine ${{ matrix.build_dir }}/bin/test_pink2.exe
 
-      # No Windows test run. Gridcoin's "Run Tests (Windows)" step (ctest under
-      # wine through CMAKE_CROSSCOMPILING_EMULATOR) does not drop in: pink2d_help
-      # runs pink2d.exe from a CMake script, which bypasses the emulator, so the
-      # suite would fail on the runner whatever wine does with the tests. The
-      # Windows build still compiles and links test_pink2.exe.
-
-      # Informational: a fully static Windows build imports only system DLLs
-      # (no libstdc++-6, libgcc_s_seh-1, libwinpthread-1 or Qt5*.dll).
-      - name: List DLL Imports (Windows)
+      # A static Windows build imports only DLLs that Windows itself provides.
+      # Fails on a MinGW runtime (libstdc++-6, libgcc_s_seh-1, libwinpthread-1),
+      # Qt, OpenSSL or zlib DLL, none of which a user's machine has, and on a
+      # program whose import list comes back empty, which only a misread gives.
+      # The full list goes to the job summary as the record of what the
+      # programs need from Windows (their OS floor).
+      - name: Check DLL Imports (Windows)
         if: contains(matrix.host, 'mingw')
         run: |
+          forbidden='^(libstdc\+\+-6|libgcc_s_seh-1|libwinpthread-1|qt5.*|libssl.*|libcrypto.*|zlib1)\.dll$'
+          fail=0
+          {
+            echo "### Windows DLL imports (built with $(x86_64-w64-mingw32-g++ --version | sed -n 1p))"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           for b in pink2d.exe Pinkcoin-Qt.exe test_pink2.exe; do
+            dlls=$(x86_64-w64-mingw32-objdump -p "${{ matrix.build_dir }}/bin/$b" | sed -n 's/^[[:space:]]*DLL Name: //p')
             echo "== $b"
-            x86_64-w64-mingw32-objdump -p "${{ matrix.build_dir }}/bin/$b" | grep 'DLL Name'
+            echo "$dlls"
+            if [ -z "$dlls" ]; then
+              echo "::error::$b has no DLL imports listed"
+              fail=1
+              continue
+            fi
+            echo "$b: $(echo "$dlls" | LC_ALL=C sort -f | tr '\n' ' ')" >> "$GITHUB_STEP_SUMMARY"
+            bad=$(echo "$dlls" | grep -iE "$forbidden" || true)
+            if [ -n "$bad" ]; then
+              echo "::error::$b imports $(echo "$bad" | tr '\n' ' ')which a static build must not"
+              fail=1
+            fi
           done
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$fail"
 
       # 10. Package
       # The two programs at the archive root and nothing else, as 2.4.0.0's.
@@ -304,8 +343,77 @@ jobs:
             echo "::error::$asset should hold exactly: ${want//$'\n'/ }"
             exit 1
           fi
+          echo "RELEASE_ARCHIVE=$asset" >> "$GITHUB_ENV"
 
-      # 11. Upload Artifacts
+      # 11. The shipped programs
+      # The checks from here on run on the programs as the archive holds them
+      # (stripped): the files users get, not the build tree's.
+      - name: Unpack the Release Archive
+        run: |
+          rel="$RUNNER_TEMP/release"
+          rm -rf "$rel"
+          mkdir -p "$rel"
+          case "${{ matrix.host }}" in
+            *linux*) tar -C "$rel" -xJf "$RELEASE_ARCHIVE" ;;
+            *mingw*) unzip -q "$RELEASE_ARCHIVE" -d "$rel" ;;
+            *) echo "::error::no release archive unpack for ${{ matrix.host }}"; exit 1 ;;
+          esac
+          ls -la "$rel"
+          echo "RELEASE_DIR=$rel" >> "$GITHUB_ENV"
+
+      # The release gate runs this archive's pink2d, and the binary a tag
+      # publishes must be the same program. doc/release-process.txt ("Release
+      # gate") compares the sha256 of its .text section, recorded here with the
+      # file's, with the gated binary's. The commit id and date that make the
+      # files differ are strings in .rodata; they leave .text as it was.
+      - name: Record the Release pink2d (Linux)
+        if: contains(matrix.host, 'linux')
+        run: |
+          text="$RUNNER_TEMP/pink2d.text"
+          objcopy -O binary --only-section=.text "$RELEASE_DIR/pink2d" "$text"
+          {
+            echo "### Linux pink2d, from $(basename "$RELEASE_ARCHIVE")"
+            echo '```'
+            echo "pink2d        sha256 $(sha256sum "$RELEASE_DIR/pink2d" | cut -d' ' -f1)"
+            echo "pink2d .text  sha256 $(sha256sum "$text" | cut -d' ' -f1) ($(stat -c %s "$text") bytes)"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # PIE, full RELRO and a non-executable stack (ELF); ASLR and DEP (PE).
+      - name: Check Binary Hardening
+        run: |
+          case "${{ matrix.host }}" in
+            *linux*) contrib/devtools/check-binary-hardening.sh "$RELEASE_DIR/pink2d" "$RELEASE_DIR/Pinkcoin-Qt" ;;
+            *mingw*) contrib/devtools/check-binary-hardening.sh "$RELEASE_DIR/pink2d.exe" "$RELEASE_DIR/Pinkcoin-Qt.exe" ;;
+            *) echo "::error::no hardening check for ${{ matrix.host }}"; exit 1 ;;
+          esac
+
+      # Testnet, networking off (-connect=0 -listen=0 -upnp=0 -staking=0),
+      # throwaway data directory: RPC up, getinfo, stop, the -rpcallowip
+      # listener, then the GUI started once. The GUI links only Qt's xcb
+      # platform plugin, so it runs under Xvfb, with the system X11 libraries
+      # it loads (check-hermetic.sh --gui's set) installed here, after the
+      # build, where no build step can find them.
+      - name: Smoke Test (Linux)
+        if: contains(matrix.host, 'linux')
+        timeout-minutes: 15
+        run: |
+          sudo apt-get install -y --no-install-recommends xvfb xauth \
+            libfontconfig1 libfreetype6 libxkbcommon0 libxkbcommon-x11-0 \
+            libxcb1 libxcb-image0 libxcb-randr0 libxcb-render0 libxcb-shape0 \
+            libxcb-shm0 libxcb-sync1 libxcb-xfixes0 libxcb-xinerama0 libxcb-xkb1
+          QT_QPA_PLATFORM=xcb xvfb-run -a .github/scripts/smoke.sh "$RELEASE_DIR/pink2d" "$RELEASE_DIR/Pinkcoin-Qt"
+
+      # The same under wine (.github/scripts/smoke-wine.sh): pink2d.exe, then
+      # Pinkcoin-Qt.exe on wine's null display driver.
+      - name: Smoke Test (Windows)
+        if: contains(matrix.host, 'mingw')
+        timeout-minutes: 15
+        env:
+          WINEARCH: win64
+        run: .github/scripts/smoke-wine.sh "$RELEASE_DIR/pink2d.exe" "$RELEASE_DIR/Pinkcoin-Qt.exe"
+
+      # 12. Upload Artifacts
       - name: Upload Artifacts
         if: ${{ !env.ACT }}
         uses: actions/upload-artifact@v5
@@ -506,9 +614,6 @@ jobs:
             echo
           done
 
-      - name: Smoke Test
-        run: .github/scripts/smoke.sh build/bin/pink2d
-
       - name: Package (DMG)
         run: cmake --build build --target deploy
 
@@ -554,6 +659,20 @@ jobs:
           tar -C "$unpacked" -xJf "$tarball"
           contrib/devtools/check-macos-binary.sh "$unpacked/pink2d" "$MACOS_DEPLOYMENT_TARGET"
           ls -la dist
+
+      # Testnet, networking off (-connect=0 -listen=0 -upnp=0 -staking=0),
+      # throwaway data directory, on the programs as users get them: pink2d
+      # from the tarball, then the GUI from the mounted DMG, on Qt's minimal
+      # platform plugin, which the bundle carries (macdeployqtplus), so no
+      # window server is needed.
+      - name: Smoke Test
+        timeout-minutes: 15
+        run: |
+          mnt="${RUNNER_TEMP}/pinkcoin-dmg"
+          mkdir -p "$mnt"
+          hdiutil attach "dist/$DMG_NAME" -readonly -nobrowse -mountpoint "$mnt"
+          trap 'hdiutil detach "$mnt" || hdiutil detach -force "$mnt" || true' EXIT
+          QT_QPA_PLATFORM=minimal .github/scripts/smoke.sh "${RUNNER_TEMP}/pink2d-check/pink2d" "$mnt/Pinkcoin-Qt.app/Contents/MacOS/Pinkcoin-Qt"
 
       - name: Upload Artifacts
         if: ${{ !env.ACT }}
@@ -709,9 +828,6 @@ jobs:
             echo
           done
 
-      - name: Smoke Test
-        run: .github/scripts/smoke.sh build/bin/pink2d
-
       - name: Package (DMG)
         run: cmake --build build --target deploy
 
@@ -752,6 +868,16 @@ jobs:
           tar -C "$unpacked" -xJf "$tarball"
           contrib/devtools/check-macos-binary.sh "$unpacked/pink2d" "$MACOS_DEPLOYMENT_TARGET"
           ls -la dist
+
+      # See the arm64 job.
+      - name: Smoke Test
+        timeout-minutes: 15
+        run: |
+          mnt="${RUNNER_TEMP}/pinkcoin-dmg"
+          mkdir -p "$mnt"
+          hdiutil attach "dist/$DMG_NAME" -readonly -nobrowse -mountpoint "$mnt"
+          trap 'hdiutil detach "$mnt" || hdiutil detach -force "$mnt" || true' EXIT
+          QT_QPA_PLATFORM=minimal .github/scripts/smoke.sh "${RUNNER_TEMP}/pink2d-check/pink2d" "$mnt/Pinkcoin-Qt.app/Contents/MacOS/Pinkcoin-Qt"
 
       - name: Upload Artifacts
         if: ${{ !env.ACT }}
