@@ -4,6 +4,8 @@ $(package)_download_path=https://download.qt.io/archive/qt/5.15/$($(package)_ver
 $(package)_suffix=everywhere-opensource-src-$($(package)_version).tar.xz
 $(package)_file_name=qtbase-$($(package)_suffix)
 $(package)_sha256_hash=0c42c799aa7c89e479a07c451bf5a301e291266ba789e81afc18f95049524edc
+# Pinkcoin: Qt links depends' OpenSSL (-openssl-linked, below).
+$(package)_dependencies=openssl
 $(package)_linux_dependencies=freetype fontconfig libxcb libxkbcommon libxcb_util libxcb_util_render libxcb_util_keysyms libxcb_util_image libxcb_util_wm
 $(package)_qt_libs=corelib network widgets gui plugins testlib concurrent
 $(package)_patches = fix_qt_pkgconfig.patch
@@ -58,7 +60,12 @@ $(package)_config_opts += -no-libjpeg
 $(package)_config_opts += -no-libproxy
 $(package)_config_opts += -no-libudev
 $(package)_config_opts += -no-mtdev
-$(package)_config_opts += -no-openssl
+# Pinkcoin: the overview page fetches its price over HTTPS (QNetworkAccessManager,
+# src/qt/overviewpage.cpp), as 2.4.0.0's release Qt did with -openssl-linked.
+# Linked statically against depends' openssl package; OPENSSL_LIBS is set in
+# config_cmds from $(package)_openssl_libs_<os>.
+#$(package)_config_opts += -no-openssl
+$(package)_config_opts += -openssl-linked
 $(package)_config_opts += -no-openvg
 $(package)_config_opts += -no-reduce-relocations
 $(package)_config_opts += -no-schannel
@@ -100,7 +107,8 @@ $(package)_config_opts += -no-feature-commandlineparser
 $(package)_config_opts += -no-feature-dial
 $(package)_config_opts += -no-feature-fontcombobox
 $(package)_config_opts += -no-feature-ftp
-$(package)_config_opts += -no-feature-http
+# Pinkcoin's price request is HTTP(S) through QNetworkAccessManager:
+#$(package)_config_opts += -no-feature-http
 $(package)_config_opts += -no-feature-image_heuristic_mask
 $(package)_config_opts += -no-feature-keysequenceedit
 $(package)_config_opts += -no-feature-lcdnumber
@@ -209,6 +217,12 @@ $(package)_config_opts_x86_64_android += -android-arch x86_64
 $(package)_config_opts_i686_android += -android-arch i686
 
 $(package)_build_env += QT_RCC_SOURCE_DATE_OVERRIDE=1
+
+# Pinkcoin: what -openssl-linked links. depends' libssl.a and libcrypto.a, plus
+# the system libraries OpenSSL itself needs (libcrypto.pc's Libs.private on
+# Linux; ex_libs of OpenSSL's mingw64 target on Windows).
+$(package)_openssl_libs_linux = -L$(host_prefix)/lib -lssl -lcrypto -ldl -lpthread
+$(package)_openssl_libs_mingw32 = -L$(host_prefix)/lib -lssl -lcrypto -lws2_32 -lgdi32 -lcrypt32
 endef
 
 define $(package)_fetch_cmds
@@ -292,6 +306,7 @@ define $(package)_config_cmds
   export PKG_CONFIG_LIBDIR=$(host_prefix)/lib/pkgconfig && \
   export PKG_CONFIG_PATH=$(host_prefix)/share/pkgconfig  && \
   export QT_MAC_SDK_NO_VERSION_CHECK=1 && \
+  export OPENSSL_LIBS="$($(package)_openssl_libs_$(host_os))" && \
   cd qtbase && \
   ./configure -top-level $($(package)_config_opts) && \
   cd .. && \
