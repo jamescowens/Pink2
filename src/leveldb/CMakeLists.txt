@@ -65,8 +65,13 @@ foreach(_target leveldb memenv)
             ${CMAKE_CURRENT_SOURCE_DIR}
     )
 
-    # The Makefile's default OPT is "-O2 -DNDEBUG", whatever the project's own
-    # build type is.
+    # NDEBUG, whatever the project's own build type is: the Makefile's default
+    # OPT is "-O2 -DNDEBUG". That matches the old build only where it kept that
+    # default: makefile.unix (and makefile.linux-mingw, which sets CXXFLAGS but
+    # not OPT). makefile.osx (OPT="$(CFLAGS)") and pinkcoin-qt.pro off Windows
+    # (OPT="$$QMAKE_CXXFLAGS $$QMAKE_CXXFLAGS_RELEASE") passed an OPT without
+    # -DNDEBUG, so 2.4.0.0's macOS builds and its Linux GUI built leveldb with
+    # its asserts live. Every build here takes makefile.unix's choice.
     target_compile_definitions(${_target} PRIVATE NDEBUG)
 
     # build_detect_platform's COMMON_FLAGS, per OS. Its -std=c++0x <cstdatomic>
