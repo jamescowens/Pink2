@@ -1,0 +1,261 @@
+Pinkcoin depends: a thinned copy of Gridcoin's depends
+=====================================================
+
+This is Gridcoin's depends system (which is Bitcoin Core's, adapted), cut down
+to what Pinkcoin builds: static dependencies for two hosts.
+
+  x86_64-pc-linux-gnu    Linux, built natively
+  x86_64-w64-mingw32     Windows, cross-built from Linux
+
+    make -C depends HOST=x86_64-pc-linux-gnu -j"$(nproc)"
+    make -C depends HOST=x86_64-w64-mingw32  -j"$(nproc)"
+
+Each run leaves depends/<host>/ with the libraries, headers, Qt host tools
+(native/bin) and toolchain.cmake. Pass that file to the first CMake call:
+
+    cmake -B build --toolchain depends/<host>/toolchain.cmake
+
+macOS is not built here: the release builds it natively against Homebrew.
+README.md, description.md and packages.md are Gridcoin's documentation,
+unchanged; parts of them describe hosts and packages this copy drops.
+
+Where each file came from
+-------------------------
+
+Taken with `git archive` (tracked files only, no build output):
+
+  HEAD   Gridcoin-Research development at 2d4e644386 (2026-11-08); its
+         depends/ last changed in 9fe993b58c (2026-10-27).
+  1ceea  Gridcoin-Research 1ceea8397e (2023-07-13), "build: Bump Qt to
+         5.15.5 in depends", Gridcoin's last Qt 5 recipe (Qt 6 support came
+         in aaac3ee843).
+  BC29   Bitcoin Core v29.2 (2d6426c296, 2025-10-10), its last Qt 5 release
+         series.
+
+  From HEAD, unchanged:
+    .gitignore config.guess config.sub gen_id README.md description.md
+    packages.md builders/{default,linux,darwin}.mk
+    hosts/{default,linux,mingw32}.mk
+    packages/{openssl,zlib,qrencode,miniupnpc,expat,libXau,xproto,
+      libxcb_util,libxcb_util_render,libxcb_util_keysyms,libxcb_util_wm}.mk
+    patches/boost/skip_compiled_targets.patch
+    patches/fontconfig/gperf_header_regen.patch (identical at 1ceea)
+    patches/miniupnpc/dont_leak_info.patch
+  From HEAD, changed (see below):
+    Makefile funcs.mk toolchain.cmake.in packages/boost.mk
+  From 1ceea, unchanged:
+    packages/freetype.mk, patches/qt/* (12 files; no_sdk_version_check.patch
+    is not applied by qt.mk, as at 1ceea)
+  From 1ceea, changed (see below):
+    packages/{qt,libxcb,fontconfig,libxkbcommon,libxcb_util_image}.mk
+  From BC29, unchanged:
+    packages/xcb_proto.mk
+  New:
+    packages/packages.mk (the package lists), README.pink2
+
+  Removed from Pinkcoin's tree: the 2.4.0.0 leftovers
+  patches/fontconfig/{gperf_header_regen,remove_char_width_usage}.patch, which
+  no build used. Gridcoin's fontconfig recipe applies its own
+  gperf_header_regen.patch (a different patch, for fontconfig 2.12.6), which
+  now sits at that path.
+
+Packages and versions
+---------------------
+
+  all hosts    boost 1.89.0, openssl 3.5.9, zlib 1.3.1, qrencode 4.1.1,
+               miniupnpc 2.2.2, qt 5.15.5 (qtbase, qttools, qttranslations,
+               qtsvg)
+  Linux only   expat 2.4.8, libxcb 1.14, xcb_proto 1.15.2, libXau 1.0.9,
+               xproto 7.0.31, freetype 2.11.0, fontconfig 2.12.6,
+               libxkbcommon 0.8.4, libxcb_util 0.4.0,
+               libxcb_util_render 0.3.9, libxcb_util_keysyms 0.4.0,
+               libxcb_util_image 0.4.0, libxcb_util_wm 0.4.1
+  native       none
+
+Every tarball is checked against the sha256 in its .mk.
+
+Versions and recipes that differ from Gridcoin's current tree
+-------------------------------------------------------------
+
+  qt            5.15.5 (Gridcoin: 6.7.3). Pinkcoin is Qt 5 only; Qt 6 is a
+                separate PR. Recipe from 1ceea.
+  libxcb        1.14 (Gridcoin: 1.17.0), 1ceea's recipe: shared library.
+  xcb_proto     1.15.2 (Gridcoin: 1.17.0), BC29's recipe.
+  fontconfig    same version, 1ceea's recipe: shared library.
+  freetype      same version, 1ceea's recipe: shared library.
+  libxkbcommon  same version, 1ceea's recipe: shared library.
+  libxcb_util_image
+                same version, 1ceea's recipe: shared library.
+
+Why. Gridcoin's current X11 recipes build static archives (1ba34e82ba,
+written for Qt 6's CMake build). Qt 5.15.5's configure takes each library's
+link line from plain `pkg-config --libs` on Linux: its `--static` rerun only
+fires when a library resolves to a .a path, and qtConfResolveLibs never does
+that on Linux. With the current recipes:
+
+  - Qt's xcb test fails at configure time: libxcb.a needs -lXau, which only
+    `pkg-config --static --libs xcb` gives (undefined reference to
+    XauGetBestAuthByAddr).
+  - fontconfig and xkbcommon-x11 pass configure, but Qt would record the
+    plain lines in its .prl files, and Pinkcoin's link would then fail:
+    libfontconfig.a needs -lexpat (11 undefined XML_* symbols), and
+    xkbcommon-x11 needs -lxcb-xkb -lxcb -lXau.
+  - The current libxkbcommon recipe also depends on xkeyboard-config, which
+    is not in this package list.
+
+So libxcb, fontconfig and libxkbcommon use 1ceea's recipes, which build
+shared libraries, as Gridcoin built Qt 5.15.5 and as BC29 still does. freetype
+goes with fontconfig: at run time the GUI loads the system's libfontconfig,
+which loads the system's FreeType, and Qt hands its FreeType faces to
+fontconfig, so a static FreeType inside the GUI would put two in one process.
+
+libxcb 1.14 then needs an older xcb-proto. With 1.17.0 its generator fails
+(KeyError: 'xcb_redirect_t' writing composite.c). 1ceea's 1.14.1 fails to
+install on Python 3.12 or later (its automake py-compile imports `imp`).
+1.15.2 is BC29's pairing with libxcb 1.14 and installs on Python 3.13.
+
+With libxcb shared, xcb-util-image is the one static xcb-util archive that
+still fails: libxcb-image.a needs libxcb-util (xcb_aux_create_gc), which
+Qt's configure never records, so a static Qt application does not link. It
+uses 1ceea's recipe too (shared, with libxcb-util inside).
+
+The other X11 recipes stay current. The static xcb-util, xcb-util-renderutil,
+xcb-util-keysyms and xcb-util-wm archives link from their plain .pc lines
+(Gridcoin's recipes add -lXau there), expat is only linked into depends'
+libfontconfig.so, and libXau and xproto were static and header-only at 1ceea
+too.
+
+Consequence: Pinkcoin-Qt on Linux loads libxcb (and its extension
+libraries), libxcb-image, libxkbcommon(-x11), libfontconfig and libfreetype
+from the system at run time, the model of every Qt 5 depends build. pink2d
+does not link any of them.
+
+Changes from the sources, and why
+---------------------------------
+
+packages/packages.mk
+  packages boost openssl zlib; qt_packages qrencode; upnp_packages miniupnpc;
+  qt_mingw32_packages qt; qt_linux_packages qt expat libxcb xcb_proto libXau
+  xproto freetype fontconfig libxkbcommon libxcb_util libxcb_util_render
+  libxcb_util_keysyms libxcb_util_image libxcb_util_wm. No native packages:
+  nothing here needs ccache or xxd.
+
+packages/qt.mk (1ceea's, with these changes)
+  - download path: download.qt.io/archive/qt/5.15/5.15.5/submodules. 5.15.5
+    is no longer under official_releases (404); the archive serves the same
+    tarballs, by the same sha256.
+  - extra_sources lists the qtsvg tarball (it named an unset variable, so the
+    source check skipped qtsvg; the extract step checked it anyway).
+  - GIF support is kept (no -no-gif): Pinkcoin's sync spinner is
+    res/movies/update_spinner.gif, played with QMovie.
+  - QColorDialog is kept (no -no-feature-colordialog): src/qt/plugins/
+    mrichtexteditor/mrichtextedit.cpp uses it, and the header refuses to
+    compile with the feature off.
+  - -no-feature-gssapi and -no-tslib: otherwise configure finds Kerberos
+    GSSAPI and tslib in the build machine's /usr and links them. Nothing in
+    Pinkcoin uses either.
+  - -bundled-xcb-xinput (Linux): libxcb is built with --disable-xinput (as
+    at 1ceea), so configure otherwise compiles against the build machine's
+    xcb/xinput.h and links its libxcb-xinput.so. Qt's bundled copy is used
+    instead.
+  - CMake packages. Pinkcoin uses find_package(Qt5 ... Widgets Network Svg
+    LinguistTools), and 1ceea's recipe served pkg-config users only:
+      * postprocess keeps lib/cmake/, native/mkspecs/ and the .prl files
+        (1ceea deleted them). Qt's static CMake packages read their link
+        dependencies from the .prl files, and Qt5::Core's include directories
+        point into native/mkspecs/.
+      * the stage step also installs qtbase's mkspecs (install_mkspecs) and
+        native/bin/qmake (sub-qmake-qmake-aux-pro-install_subtargets):
+        Qt5Core's CMake package refuses to load without either.
+      * qmake also runs on qttools/src/linguist/linguist.pro, which writes
+        lib/cmake/Qt5LinguistTools/*, and the stage step installs only those
+        files (install_cmake_linguist_tools_files). Only lrelease, lupdate
+        and lconvert are built, as at 1ceea.
+  Everything else (configure options, patches, the build of qtbase, qtsvg,
+  qttranslations and the three linguist tools) is 1ceea's.
+
+packages/libxcb.mk, packages/fontconfig.mk, packages/libxcb_util_image.mk
+(1ceea's)
+  - --libdir=<prefix>/lib, the line Gridcoin's current recipes carry. A
+    build machine whose config.site moves the default libdir to lib64
+    (openSUSE) otherwise installs the .pc files where pkg-config does not
+    look. Gridcoin added this in 9eec6909a1 (2021); the 1ceea recipes had
+    lost it.
+
+packages/libxkbcommon.mk (1ceea's)
+  - -Wno-error=array-bounds, the line Gridcoin's current recipe carries.
+    GCC 12 and later flag src/xkbcomp/ast-build.c, and 0.8.4 builds with
+    -Werror.
+
+packages/boost.mk (HEAD's)
+  - depends on zlib only (bzip2 and xz are dropped), and Boost.Iostreams is
+    configured with BZip2, LZMA and Zstd off so that it cannot pick up the
+    build machine's libraries.
+  - BOOST_INCLUDE_LIBRARIES is Pinkcoin's set: the libraries src/ includes or
+    links (filesystem, program_options, thread, chrono and test are
+    compiled; the rest are headers). Gridcoin's list has no program_options
+    or spirit.
+
+Makefile (HEAD's)
+  - the multiprocess (Cap'n Proto) hooks are removed, with their packages.
+  - download-osx is removed from `make download` (no darwin host here).
+  - the closing message says Pinkcoin.
+
+toolchain.cmake.in (HEAD's)
+  - the multiprocess block is removed. The Darwin blocks are inert for these
+    two hosts and stay as Gridcoin has them.
+
+funcs.mk (HEAD's)
+  - the configure, build and stage lines lose their '+' prefix when make
+    runs with -n. GNU make runs '+' lines even under -n, so on a fresh tree
+    `make -n` executed them before anything was extracted, and the failed
+    'cd' left them running in depends/ itself (zlib's `cmake -S ..` then
+    configured Pinkcoin's own CMakeLists.txt). Now `make -n` only prints. A
+    normal build is unchanged.
+
+Dropped from Gridcoin's tree
+----------------------------
+
+  Packages: capnp, native_capnp, native_libmultiprocess, libevent, curl,
+  bzip2, xz, pcre2, harfbuzz, libpng, libXdmcp, libxcb_util_cursor, libICE,
+  libSM, util-macros, xkeyboard-config, native_qt, qt_details.mk,
+  native_ccache, native_xxd, native_ds_store, native_mac_alias,
+  native_libdmg-hfsplus, and Gridcoin's Qt 6 qt.mk. libzip, which 1ceea had,
+  is not here either.
+  Hosts: darwin (hosts/darwin.mk). Android and FreeBSD hosts were never in
+  Gridcoin's tree. builders/darwin.mk stays: it describes a Mac as the
+  build machine, not a host.
+  Patches: Gridcoin's Qt 6 patches/qt/* (fix-gcc16-*, qtbase_*,
+  rcc_hardcode_timestamp; 1ceea's set replaces them), native_biplist,
+  native_cdrkit, native_libdmg-hfsplus.
+  config.site.in: the CMake-only Makefile no longer generates config.site.
+
+Notes for users of this tree
+----------------------------
+
+  - Qt 5's static CMake packages call find_library() for every -l in their
+    .prl files (m, dl, ...). toolchain.cmake sets
+    CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY, which hides the system's libm,
+    so find_package(Qt5) fails with "Library not found: m". The consumer
+    sets the mode to BOTH around find_package(Qt5) only, as Bitcoin Core
+    v29's cmake/module/FindQt.cmake does.
+  - Static Qt plugins must be linked and imported by the application
+    (Qt5::QXcbIntegrationPlugin, Qt5::QGifPlugin, Qt5::QSvgPlugin,
+    Qt5::QSvgIconPlugin with Q_IMPORT_PLUGIN). The Qt 4 codec plugins that
+    src/qt/bitcoin.cpp imports under BITCOIN_NEED_QT_PLUGINS do not exist in
+    Qt 5; the codecs are built into QtCore.
+  - Qt is configured with -no-openssl and -no-feature-http (1ceea), so the
+    overview page's HTTPS price request gets no reply.
+  - Source fallback: FALLBACK_DOWNLOAD_PATHS is Gridcoin's, bitcoincore.org's
+    depends-sources first, then Gridcoin's S3 mirror.
+  - After a failed build, remove depends/<host>/.<package>_stamp_configured
+    (or `make -C depends HOST=<host> clean`) before building again. That
+    stamp is named by package, not by build id, so a stale one makes the
+    next run skip configure for a new version (upstream behaviour).
+  - Gridcoin's funcs.mk runs `xargs $(build_TOUCH)` while caching a package,
+    and no builder defines build_TOUCH, so xargs only echoes the file list.
+    Harmless; kept as Gridcoin has it.
+  - The libraries are built with -std=c++17 (CXX_STANDARD, as Gridcoin), and
+    Qt with -c++std c++17. toolchain.cmake puts -std=c++17 in
+    CMAKE_CXX_FLAGS_INIT; Pinkcoin's CMAKE_CXX_STANDARD 11 adds -std=c++11
+    after it, and the last one wins.
