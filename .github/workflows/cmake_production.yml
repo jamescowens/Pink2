@@ -68,12 +68,17 @@ jobs:
         include:
           # Linux on 22.04 for its older glibc (2.35): a binary needs at least
           # the glibc it was linked against. The floor goes to the job summary.
+          # USE_DBUS: pinkcoin-qt.pro turns D-Bus notifications on for Linux by
+          # default, and 2.4.0.0's Linux GUI had them. Depends' Qt opens
+          # libdbus-1 at run time (-dbus-runtime), so the GUI needs no new
+          # library to start. macOS and Windows stay without, as in 2.4.0.0.
           - name: Linux Static
             os: ubuntu-22.04
             host: x86_64-pc-linux-gnu
             build_dir: build_linux
             cmake_args: >-
               -DENABLE_PIE=ON
+              -DUSE_DBUS=ON
               -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++ -Wl,-Bdynamic"
             cpack_generator: TXZ
 
