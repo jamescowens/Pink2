@@ -640,14 +640,28 @@ jobs:
           cp "$dmg" dist/
           echo "DMG_NAME=$(basename "$dmg")" >> "$GITHUB_ENV"
 
-      # pink2d ships beside the DMG, on its own, as in 2.4.0.0; the check runs on
-      # the copy unpacked from the tarball.
+      # pink2d ships beside the DMG, on its own and stripped, as in 2.4.0.0; the
+      # check runs on the copy unpacked from the tarball. A stripped copy, so
+      # that build/bin/pink2d keeps its symbols. strip rewrites the file, and
+      # an arm64 binary whose (linker-made, ad hoc) signature no longer
+      # verifies is killed at launch, so the copy is signed again ad hoc if it
+      # was signed before and the strip broke that.
       - name: Package pink2d
         run: |
           tarball="dist/${DMG_NAME%.dmg}-pink2d.tar.xz"
+          stage="${RUNNER_TEMP}/pink2d-stage"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          cp build/bin/pink2d "$stage/pink2d"
+          strip "$stage/pink2d"
+          if codesign --verify build/bin/pink2d 2>/dev/null && ! codesign --verify "$stage/pink2d" 2>/dev/null; then
+            echo "strip invalidated pink2d's signature; signing the stripped copy ad hoc"
+            codesign --force --sign - "$stage/pink2d"
+          fi
+          ls -l build/bin/pink2d "$stage/pink2d"
           # COPYFILE_DISABLE: macOS tar otherwise adds an AppleDouble ._pink2d
           # for the file's extended attributes.
-          COPYFILE_DISABLE=1 tar -C build/bin -cJf "$tarball" pink2d
+          COPYFILE_DISABLE=1 tar -C "$stage" -cJf "$tarball" pink2d
           listing=$(tar -tJf "$tarball")
           if [ "$listing" != pink2d ]; then
             echo "::error::$tarball should hold only pink2d; it holds: $listing"
@@ -856,7 +870,17 @@ jobs:
       - name: Package pink2d
         run: |
           tarball="dist/${DMG_NAME%.dmg}-pink2d.tar.xz"
-          COPYFILE_DISABLE=1 tar -C build/bin -cJf "$tarball" pink2d
+          stage="${RUNNER_TEMP}/pink2d-stage"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          cp build/bin/pink2d "$stage/pink2d"
+          strip "$stage/pink2d"
+          if codesign --verify build/bin/pink2d 2>/dev/null && ! codesign --verify "$stage/pink2d" 2>/dev/null; then
+            echo "strip invalidated pink2d's signature; signing the stripped copy ad hoc"
+            codesign --force --sign - "$stage/pink2d"
+          fi
+          ls -l build/bin/pink2d "$stage/pink2d"
+          COPYFILE_DISABLE=1 tar -C "$stage" -cJf "$tarball" pink2d
           listing=$(tar -tJf "$tarball")
           if [ "$listing" != pink2d ]; then
             echo "::error::$tarball should hold only pink2d; it holds: $listing"
