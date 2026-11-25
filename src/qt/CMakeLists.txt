@@ -247,6 +247,12 @@ add_dependencies(Pinkcoin-Qt pink2_build_info)
 set_target_properties(Pinkcoin-Qt PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+# The NDEBUG guard (src/CMakeLists.txt, "Assertions stay enabled"): the GUI
+# compiles the core sources itself, with its own flags, so it gets the check
+# too.
+set_source_files_properties("${PINK2_NDEBUG_GUARD}" PROPERTIES SKIP_AUTOGEN ON)
+target_sources(Pinkcoin-Qt PRIVATE "${PINK2_NDEBUG_GUARD}")
+
 # INCLUDEPATH src src/json src/qt src/qt/plugins/mrichtexteditor
 target_include_directories(Pinkcoin-Qt PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/.."
