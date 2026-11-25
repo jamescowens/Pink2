@@ -167,8 +167,27 @@ list(APPEND BDB_FLAGS
     "CXXFLAGS=${BDB_CXX_FLAGS}"
 )
 if(CMAKE_CROSSCOMPILING)
+    # configure needs the host triple to know it is cross compiling. Take it
+    # from CMAKE_C_COMPILER_TARGET (depends and toolchain files set it), else
+    # ask the compiler.
+    set(BDB_HOST "${CMAKE_C_COMPILER_TARGET}")
+    if(NOT BDB_HOST)
+        execute_process(
+            COMMAND ${CMAKE_C_COMPILER} ${CMAKE_C_COMPILER_ARG1} -dumpmachine
+            OUTPUT_VARIABLE BDB_HOST
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+            RESULT_VARIABLE bdb_dumpmachine_result
+        )
+        if(NOT bdb_dumpmachine_result EQUAL 0 OR NOT BDB_HOST MATCHES "^[A-Za-z0-9_.]+(-[A-Za-z0-9_.]+)+$")
+            message(FATAL_ERROR "Berkeley DB (bundled): cannot tell the host triple to cross compile for "
+                                "(${CMAKE_C_COMPILER} -dumpmachine gave \"${BDB_HOST}\"). "
+                                "Set CMAKE_C_COMPILER_TARGET, e.g. -DCMAKE_C_COMPILER_TARGET=x86_64-w64-mingw32.")
+        endif()
+    endif()
+    message(STATUS "Berkeley DB (bundled): HOST=${BDB_HOST}")
     list(APPEND BDB_FLAGS
-        "--host=${CMAKE_C_COMPILER_TARGET}"
+        "--host=${BDB_HOST}"
         "AR=${CMAKE_AR}"
         "RANLIB=${CMAKE_RANLIB}"
     )
