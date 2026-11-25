@@ -1,0 +1,872 @@
+# Builds Pinkcoin for the four release platforms on every push and pull
+# request, and makes the release assets:
+#
+#   Pinkcoin-Linux-<ver>.tar.xz            depends, static but for libc/libm (GUI: + system X11)
+#   Pinkcoin-Win64-<ver>.zip               depends, mingw-w64 cross, static
+#   Pinkcoin-macOS-arm64-<ver>.dmg         Homebrew, floor 15.0
+#   Pinkcoin-macOS-x86_64-<ver>.dmg        pinned Homebrew kegs, floor 14.0
+#   Pinkcoin-macOS-<arch>-<ver>-pink2d.tar.xz
+#   SHA256SUMS
+#
+# <ver> is src/clientversion.h's. A four-part tag push (e.g. 2.4.1.0) puts them
+# in a DRAFT release; a manual run with dry_run_release collects them into the
+# release-assets artifact and creates nothing.
+#
+# Thinned from Gridcoin-Research's .github/workflows/cmake_production.yml
+# (development at 2d4e644386). Kept: the job layout, the depends cache, the
+# concurrency setup, the macOS ccache and inert signing steps, the bounded test
+# runs, the crash-report dump and the deploy job. Dropped: flatpak, docker, the
+# amd64-native and arm64-cross builds, multiprocess/capnp, the NSIS installer,
+# Qt 6, the DMG venv (ds_store/mac_alias), the notarization step (it needs a
+# Developer ID and the hardened runtime, which Pink2's bundle has neither of),
+# and the steps for tools Pink2 does not have (install_dependencies.sh,
+# check-build-warnings.sh, check-binary-hardening.sh). Gridcoin's inline
+# hermeticity and DMG checks are contrib/devtools scripts here.
+
+name: CMake Production Builds
+
+on:
+  push:
+    branches:
+      - '**'
+    # Pinkcoin's four-part release tags. With a tags filter present, a branch
+    # push still needs the branches filter above to run at all.
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+.[0-9]+'
+  pull_request:
+    branches:
+      - '**'
+  workflow_dispatch:
+    inputs:
+      dry_run_release:
+        description: 'Collect the release assets and SHA256SUMS into the release-assets artifact; create no release'
+        type: boolean
+        default: false
+
+# Read-only for every job; deploy alone may write (the draft release).
+permissions:
+  contents: read
+
+# bash -eo pipefail for every step, so a failure inside a pipeline fails it.
+defaults:
+  run:
+    shell: bash
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  # ----------------------------------------------------------------------
+  # JOB 1: Depends Builds (Linux Static & Windows Cross)
+  # ----------------------------------------------------------------------
+  depends-builds:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux on 22.04 for its older glibc (2.35): a binary needs at least
+          # the glibc it was linked against. The floor goes to the job summary.
+          - name: Linux Static
+            os: ubuntu-22.04
+            host: x86_64-pc-linux-gnu
+            build_dir: build_linux
+            cmake_args: >-
+              -DENABLE_PIE=ON
+              -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++ -Wl,-Bdynamic"
+            cpack_generator: TXZ
+
+          - name: Windows Cross
+            os: ubuntu-24.04
+            host: x86_64-w64-mingw32
+            build_dir: build_win64
+            cmake_args: >-
+              -DCMAKE_EXE_LINKER_FLAGS="-static"
+            cpack_generator: ZIP
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # 1. Install Host Tools
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          # What depends needs from the host: a compiler and make, autoreconf
+          # (qrencode), patch, Python (xcb-proto) and curl. CMake is the image's.
+          # Nothing else: every library comes from depends, and a host -dev
+          # package is one more thing Qt's configure could pick up.
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake libtool pkg-config bison patch \
+            python3 curl xz-utils
+
+          if [[ "${{ matrix.host }}" == *"mingw"* ]]; then
+            sudo apt-get install -y --no-install-recommends g++-mingw-w64-x86-64
+            # Gridcoin's threading fix: the posix model, which depends and
+            # Boost.Thread are built for. A missing alternative is an error here
+            # (Gridcoin warns), since the build would silently use win32 threads.
+            for tool in g++ gcc; do
+              posix="/usr/bin/x86_64-w64-mingw32-${tool}-posix"
+              if [ ! -f "$posix" ]; then
+                echo "::error::$posix not found; cannot select the posix threading model"
+                exit 1
+              fi
+              sudo update-alternatives --set "x86_64-w64-mingw32-${tool}" "$posix"
+            done
+          fi
+
+      - name: Toolchain versions
+        run: |
+          cmake --version | sed -n 1p
+          gcc --version | sed -n 1p
+          ldd --version | sed -n 1p
+          if [[ "${{ matrix.host }}" == *"mingw"* ]]; then
+            x86_64-w64-mingw32-g++ --version | sed -n 1p
+            # Fails unless the alternative above took.
+            x86_64-w64-mingw32-g++ -v 2>&1 | grep 'Thread model: posix'
+          fi
+
+      # 2. Setup Concurrency
+      - name: Setup Concurrency
+        run: |
+          if [ -z "$CMAKE_BUILD_PARALLEL_LEVEL" ]; then
+            echo "CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)" >> $GITHUB_ENV
+            echo "CTEST_PARALLEL_LEVEL=$(nproc)" >> $GITHUB_ENV
+            echo "Concurrency: Auto-detected $(nproc) cores."
+          else
+            echo "Concurrency: Limit set externally to $CMAKE_BUILD_PARALLEL_LEVEL."
+          fi
+
+      # 3. Cache Depends
+      #
+      # Restored to the path it was built at, and it must be: depends/<host>/
+      # toolchain.cmake and the .prl files Qt's static CMake packages read hold
+      # absolute paths (-L<checkout>/depends/<host>/lib). The checkout path is
+      # the same on every run (/home/runner/work/<repo>/<repo>), so a restore
+      # lands where those paths point.
+      #
+      # toolchain.cmake.in is in the key too: on a hit `make` does not run, and
+      # it is the file depends turns into the toolchain this build uses.
+      #
+      # Restore and save are separate steps so that the depends tree is saved as
+      # soon as it is built, even if a later step fails; the Qt build is the
+      # slow part of a cold run. A partial restore (restore-keys) lets make
+      # reuse every package whose recipe did not change.
+      - name: Restore Depends
+        id: cache-depends
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            depends/built
+            depends/${{ matrix.host }}
+          key: ${{ matrix.os }}-depends-${{ matrix.host }}-${{ hashFiles('depends/packages/*', 'depends/patches/**', 'depends/Makefile', 'depends/funcs.mk', 'depends/hosts/*', 'depends/builders/*', 'depends/toolchain.cmake.in') }}
+          restore-keys: |
+            ${{ matrix.os }}-depends-${{ matrix.host }}-
+
+      # 4. Build Depends
+      - name: Build Depends
+        if: steps.cache-depends.outputs.cache-hit != 'true'
+        run: make -C depends HOST=${{ matrix.host }} -j"$(nproc)"
+
+      - name: Save Depends
+        if: steps.cache-depends.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            depends/built
+            depends/${{ matrix.host }}
+          key: ${{ steps.cache-depends.outputs.cache-primary-key }}
+
+      # 5. Configure CMake
+      # The release configuration: UPnP compiled in and on by default
+      # (2.4.0.0's USE_UPNP=1), QR codes, static libraries. No ccache: Gridcoin's
+      # depends jobs pass the launcher but keep no ccache directory between runs,
+      # so every compile misses.
+      - name: Configure CMake
+        run: |
+          cmake -B ${{ matrix.build_dir }} \
+            --toolchain "$PWD/depends/${{ matrix.host }}/toolchain.cmake" \
+            -DENABLE_GUI=ON \
+            -DENABLE_QRENCODE=ON \
+            -DENABLE_UPNP=ON \
+            -DDEFAULT_UPNP=ON \
+            -DENABLE_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DSTATIC_LIBS=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            ${{ matrix.cmake_args }}
+
+      # 6. Build
+      - name: Build
+        run: cmake --build ${{ matrix.build_dir }}
+
+      # 7. Same program as the old build (Linux)
+      #
+      # The defines main.cpp is compiled with must be makefile.unix's.
+      # USE_UPNP=1 because the release is DEFAULT_UPNP=ON. Boost's CMake package
+      # marks a static Boost with linkage-selection macros the makefiles never
+      # pass (BOOST_<LIB>_STATIC_LINK, BOOST_THREAD_USE_LIB); they choose between
+      # the Windows DLL and static entry points and change no code on Linux, so
+      # they are left out, and the script prints each one it leaves out.
+      - name: Check Defines Against makefile.unix (Linux)
+        if: contains(matrix.host, 'linux')
+        run: |
+          contrib/devtools/compare-defines.sh \
+            --ignore '^BOOST_[A-Z0-9_]+_(STATIC_LINK|DYN_LINK|NO_LIB)$|^BOOST_THREAD_USE_LIB$' \
+            ${{ matrix.build_dir }} USE_UPNP=1
+
+      # The source lists must be the old build's. ENABLE_GUI=ON above, so the
+      # pinkcoin-qt.pro comparison runs too.
+      - name: Check Source Lists Against the Old Build (Linux)
+        if: contains(matrix.host, 'linux')
+        run: python3 -I contrib/devtools/check-cmake-sources.py --build-dir ${{ matrix.build_dir }}
+
+      # 8. Hermeticity Check
+      # Two calls on purpose: --gui allows the system X11 set for every binary
+      # named in its call, and pink2d and test_pink2 may load only libc, libm
+      # and the loader (with glibc's split libraries).
+      - name: Verify Hermeticity (Linux)
+        if: contains(matrix.host, 'linux')
+        run: |
+          contrib/devtools/check-hermetic.sh ${{ matrix.build_dir }}/bin/pink2d ${{ matrix.build_dir }}/bin/test_pink2
+          contrib/devtools/check-hermetic.sh --gui ${{ matrix.build_dir }}/bin/Pinkcoin-Qt
+
+      - name: Record the glibc Floor (Linux)
+        if: contains(matrix.host, 'linux')
+        run: |
+          floor=$(contrib/devtools/glibc-floor.sh ${{ matrix.build_dir }}/bin/pink2d ${{ matrix.build_dir }}/bin/Pinkcoin-Qt)
+          echo "$floor"
+          {
+            echo "### Linux glibc floor (built with $(ldd --version | sed -n 1p))"
+            echo '```'
+            echo "$floor"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 9. Test (Linux)
+      - name: Run Tests (Linux)
+        if: contains(matrix.host, 'linux')
+        env:
+          QT_QPA_PLATFORM: offscreen
+        # Bounded twice: --timeout makes ctest kill and report the test that
+        # overran; timeout-minutes is the backstop for a hang outside ctest.
+        timeout-minutes: 45
+        run: ctest --test-dir ${{ matrix.build_dir }} --output-on-failure --timeout 1800
+
+      # Testnet, networking off (-connect=0 -listen=0 -upnp=0 -staking=0),
+      # throwaway data directory: RPC up, getinfo, stop, and the -rpcallowip
+      # listener.
+      - name: Smoke Test (Linux)
+        if: contains(matrix.host, 'linux')
+        run: .github/scripts/smoke.sh ${{ matrix.build_dir }}/bin/pink2d
+
+      # No Windows test run. Gridcoin's "Run Tests (Windows)" step (ctest under
+      # wine through CMAKE_CROSSCOMPILING_EMULATOR) does not drop in: pink2d_help
+      # runs pink2d.exe from a CMake script, which bypasses the emulator, so the
+      # suite would fail on the runner whatever wine does with the tests. The
+      # Windows build still compiles and links test_pink2.exe.
+
+      # Informational: a fully static Windows build imports only system DLLs
+      # (no libstdc++-6, libgcc_s_seh-1, libwinpthread-1 or Qt5*.dll).
+      - name: List DLL Imports (Windows)
+        if: contains(matrix.host, 'mingw')
+        run: |
+          for b in pink2d.exe Pinkcoin-Qt.exe test_pink2.exe; do
+            echo "== $b"
+            x86_64-w64-mingw32-objdump -p "${{ matrix.build_dir }}/bin/$b" | grep 'DLL Name'
+          done
+
+      # 10. Package
+      # The two programs at the archive root and nothing else, as 2.4.0.0's.
+      - name: Create Package
+        run: |
+          cpack -G ${{ matrix.cpack_generator }} --config ${{ matrix.build_dir }}/CPackConfig.cmake -B release_packages
+
+          shopt -s nullglob
+          assets=(release_packages/Pinkcoin-*.tar.xz release_packages/Pinkcoin-*.zip)
+          if [ "${#assets[@]}" -ne 1 ]; then
+            echo "::error::expected one archive in release_packages, found ${#assets[@]}: ${assets[*]}"
+            exit 1
+          fi
+          asset="${assets[0]}"
+          case "${{ matrix.host }}" in
+            *linux*) want=$'Pinkcoin-Qt\npink2d'; got=$(tar -tJf "$asset" | LC_ALL=C sort) ;;
+            *mingw*) want=$'Pinkcoin-Qt.exe\npink2d.exe'; got=$(unzip -Z1 "$asset" | LC_ALL=C sort) ;;
+          esac
+          echo "$asset:"
+          echo "$got"
+          if [ "$got" != "$want" ]; then
+            echo "::error::$asset should hold exactly: ${want//$'\n'/ }"
+            exit 1
+          fi
+
+      # 11. Upload Artifacts
+      - name: Upload Artifacts
+        if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: pinkcoin-${{ matrix.host }}
+          path: |
+            release_packages/Pinkcoin-*.tar.xz
+            release_packages/Pinkcoin-*.zip
+          if-no-files-found: error
+          retention-days: 5
+
+  # ----------------------------------------------------------------------
+  # JOB 2: macOS Native
+  # ----------------------------------------------------------------------
+  macos-native-arm64:
+    name: macOS ARM64 (Homebrew Qt 5)
+    # Floor 15.0. Homebrew sets no deployment target, so a bottle's minimum is
+    # the macOS it was built on, and its arm64 bottles of boost, openssl@3 and
+    # miniupnpc exist only for sequoia and later. macdeployqtplus copies those
+    # dylibs into the bundle, so the bundle's real floor is 15.0 and it declares
+    # that; check-macos-bundle.sh holds the declaration to the measured floor.
+    #
+    # Homebrew is not pinned on this runner (pinning needs arm64 kegs built on
+    # an arm64 macOS 15 machine). The job prints the versions it got and fails
+    # if qt@5 is not 5.15.x, openssl@3 not 3.x, or Boost older than 1.85.
+    runs-on: macos-15
+    env:
+      MACOS_DEPLOYMENT_TARGET: "15.0"
+      MACOS_ARCH: arm64
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Dependencies
+        run: |
+          brew update
+          # The image hand-links a leftover openssl@1.1 at $(brew --prefix)/bin/openssl.
+          # The link points at the opt/openssl@1.1 path, not into the Cellar keg, so
+          # `brew unlink openssl@1.1` skips it, and since homebrew-core f2e47cf7746c
+          # (2026-09-28) the openssl@3 relink fails on it and brew install exits 1.
+          # Nothing here needs 1.1: the build names openssl@3 by prefix.
+          openssl_link="$(brew --prefix)/bin/openssl"
+          case "$(readlink "$openssl_link" 2>/dev/null)" in
+            */openssl@1.1/bin/openssl) rm -f "$openssl_link" ;;
+          esac
+          pkgs=(qt@5 boost openssl@3 miniupnpc qrencode ccache)
+          # The image has a cmake; Homebrew's only if it does not.
+          command -v cmake >/dev/null 2>&1 || pkgs+=(cmake)
+          brew install "${pkgs[@]}"
+
+      # The versions the build uses, read from the kegs it is pointed at.
+      - name: Check and Record Dependency Versions
+        run: |
+          boost_number=$(sed -n 's/^#define BOOST_VERSION \([0-9][0-9]*\).*/\1/p' "$(brew --prefix boost)/include/boost/version.hpp")
+          if [ -z "$boost_number" ]; then
+            echo "::error::no BOOST_VERSION in $(brew --prefix boost)/include/boost/version.hpp"
+            exit 1
+          fi
+          boost_version="$((boost_number / 100000)).$((boost_number / 100 % 1000)).$((boost_number % 100))"
+          qt_version=$("$(brew --prefix qt@5)/bin/qmake" -query QT_VERSION)
+          openssl_version=$("$(brew --prefix openssl@3)/bin/openssl" version | awk '{print $2}')
+          {
+            echo "### macOS arm64 Homebrew versions"
+            echo '```'
+            brew list --versions qt@5 boost openssl@3 miniupnpc qrencode ccache
+            echo "in use: Qt $qt_version, OpenSSL $openssl_version, Boost $boost_version"
+            echo "$(clang --version | sed -n 1p); $(cmake --version | sed -n 1p)"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          fail=0
+          case "$qt_version" in
+            5.15.*) ;;
+            *) echo "::error::qt@5 is Qt $qt_version; this build needs Qt 5.15.x"; fail=1 ;;
+          esac
+          case "$openssl_version" in
+            3.*) ;;
+            *) echo "::error::openssl@3 is OpenSSL $openssl_version; this build needs OpenSSL 3.x"; fail=1 ;;
+          esac
+          if [ "$boost_number" -lt 108500 ]; then
+            echo "::error::Boost is $boost_version; this build needs 1.85 or later"
+            fail=1
+          fi
+          exit "$fail"
+
+      - name: Configure Ccache
+        uses: actions/cache@v5
+        with:
+          path: /Users/runner/Library/Caches/ccache
+          key: ccache-macos-arm64-${{ github.sha }}
+          restore-keys: ccache-macos-arm64-
+
+      # Setup Concurrency for macOS too
+      - name: Setup Concurrency
+        run: |
+          if [ -z "$CMAKE_BUILD_PARALLEL_LEVEL" ]; then
+            # macOS usually uses sysctl -n hw.logicalcpu, but nproc might not exist
+            # We'll use the sysctl command directly
+            CORES=$(sysctl -n hw.logicalcpu)
+            echo "CMAKE_BUILD_PARALLEL_LEVEL=$CORES" >> $GITHUB_ENV
+            echo "CTEST_PARALLEL_LEVEL=$CORES" >> $GITHUB_ENV
+            echo "Concurrency: Auto-detected $CORES cores."
+          else
+            echo "Concurrency: Limit set externally to $CMAKE_BUILD_PARALLEL_LEVEL."
+          fi
+
+      # Inert without the secrets, as Pink2 has no Apple Developer ID: the deploy
+      # target then signs the bundle ad hoc.
+      - name: Import Code Signing Certificate
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE_P12" ]; then
+            echo "No signing certificate configured, skipping import."
+            exit 0
+          fi
+
+          KEYCHAIN_PATH="${RUNNER_TEMP}/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          CERT_PATH="${RUNNER_TEMP}/certificate.p12"
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          rm -f "$CERT_PATH"
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
+
+      - name: Set Signing Identity
+        run: |
+          if [ -n "$IDENTITY" ]; then
+            echo "APPLE_SIGNING_IDENTITY=$IDENTITY" >> $GITHUB_ENV
+            echo "Signing identity configured."
+          else
+            echo "No signing identity configured, will use ad-hoc signing."
+          fi
+        env:
+          IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+
+      - name: Configure CMake
+        run: |
+          launcher=()
+          if command -v ccache >/dev/null 2>&1; then
+            launcher=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+          else
+            echo "ccache not found; building without it."
+          fi
+          cmake -B build \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix qt@5)" \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" \
+            -DENABLE_GUI=ON \
+            -DENABLE_QRENCODE=ON \
+            -DENABLE_UPNP=ON \
+            -DDEFAULT_UPNP=ON \
+            -DENABLE_PIE=ON \
+            -DENABLE_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            "${launcher[@]}"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        # Bounded twice on purpose. --timeout makes ctest kill and REPORT the test
+        # that overran, which is the diagnosable outcome; timeout-minutes is the
+        # backstop for a hang outside ctest itself. Without either, a stuck test
+        # runs to the six-hour job default on a runner billed at ten times the
+        # Linux rate, and produces no usable log when it is finally cancelled.
+        # pink2d_macos_static checks the build tree's pink2d against the floor.
+        timeout-minutes: 45
+        run: ctest --test-dir build --output-on-failure --timeout 1800
+
+      - name: Dump crash reports on test failure
+        # macOS writes a symbolicated report to DiagnosticReports when a process
+        # aborts. Without this the only evidence of a crash is the terminate
+        # message on stderr, which names the exception type but not where it was
+        # thrown.
+        if: failure()
+        run: |
+          echo "=== DiagnosticReports ==="
+          ls -la ~/Library/Logs/DiagnosticReports/ 2>/dev/null || echo "  (none)"
+          for f in ~/Library/Logs/DiagnosticReports/*pink2* ~/Library/Logs/DiagnosticReports/*Pinkcoin*; do
+            [ -e "$f" ] || continue
+            echo "---------- $f"
+            # .ips reports are JSON with a leading metadata line; print raw either way.
+            head -c 20000 "$f"
+            echo
+          done
+
+      - name: Smoke Test
+        run: .github/scripts/smoke.sh build/bin/pink2d
+
+      - name: Package (DMG)
+        run: cmake --build build --target deploy
+
+      # The DMG as users get it: its app against the declared floor (every
+      # Mach-O's minimum, the plist, no load of the build machine's Homebrew),
+      # and its signature.
+      - name: Verify DMG Package
+        run: |
+          shopt -s nullglob
+          dmgs=(build/Pinkcoin-macOS-"$MACOS_ARCH"-*.dmg)
+          if [ "${#dmgs[@]}" -ne 1 ]; then
+            echo "::error::expected one build/Pinkcoin-macOS-$MACOS_ARCH-*.dmg, found ${#dmgs[@]}"
+            printf '%s\n' build/*.dmg
+            exit 1
+          fi
+          dmg="${dmgs[0]}"
+          mnt="${RUNNER_TEMP}/pinkcoin-dmg"
+          mkdir -p "$mnt"
+          hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mnt"
+          trap 'hdiutil detach "$mnt" || hdiutil detach -force "$mnt" || true' EXIT
+          contrib/devtools/check-macos-bundle.sh "$mnt/Pinkcoin-Qt.app" "$MACOS_DEPLOYMENT_TARGET"
+          codesign --verify --strict --verbose=2 "$mnt/Pinkcoin-Qt.app"
+          mkdir -p dist
+          cp "$dmg" dist/
+          echo "DMG_NAME=$(basename "$dmg")" >> "$GITHUB_ENV"
+
+      # pink2d ships beside the DMG, on its own, as in 2.4.0.0; the check runs on
+      # the copy unpacked from the tarball.
+      - name: Package pink2d
+        run: |
+          tarball="dist/${DMG_NAME%.dmg}-pink2d.tar.xz"
+          # COPYFILE_DISABLE: macOS tar otherwise adds an AppleDouble ._pink2d
+          # for the file's extended attributes.
+          COPYFILE_DISABLE=1 tar -C build/bin -cJf "$tarball" pink2d
+          listing=$(tar -tJf "$tarball")
+          if [ "$listing" != pink2d ]; then
+            echo "::error::$tarball should hold only pink2d; it holds: $listing"
+            exit 1
+          fi
+          unpacked="${RUNNER_TEMP}/pink2d-check"
+          rm -rf "$unpacked"
+          mkdir -p "$unpacked"
+          tar -C "$unpacked" -xJf "$tarball"
+          contrib/devtools/check-macos-binary.sh "$unpacked/pink2d" "$MACOS_DEPLOYMENT_TARGET"
+          ls -la dist
+
+      - name: Upload Artifacts
+        if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: pinkcoin-macos-arm64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 5
+
+      - name: Cleanup Signing Keychain
+        if: ${{ always() && env.KEYCHAIN_PATH != '' }}
+        run: security delete-keychain "$KEYCHAIN_PATH" || true
+
+  macos-native-intel:
+    name: macOS Intel (pinned Homebrew kegs)
+    # A native Intel runner, available until August 2027
+    # (actions/runner-images#13045). Floor 14.0: the five pinned kegs were built
+    # (or poured) on native Intel macOS 14, and the DMG check measures it.
+    runs-on: macos-15-intel
+    env:
+      MACOS_DEPLOYMENT_TARGET: "14.0"
+      MACOS_ARCH: x86_64
+    steps:
+      - uses: actions/checkout@v5
+
+      # Homebrew's Intel support is Tier 3: a formula with no Intel bottle is
+      # source-built on the runner (hours for Qt, and the result needs the
+      # RUNNER's macOS), and qt@5 is on its way out. So Boost, OpenSSL,
+      # miniupnpc, qrencode and Qt come from Pink2's mirrored kegs
+      # (contrib/devtools/macos-pinned-kegs.txt), sha256-checked, and nothing is
+      # installed from Homebrew after them: an install could also pull a pinned
+      # keg forward through its dependencies. cmake and ccache are the runner
+      # image's. The image has cmake; without a ccache the build runs without
+      # one, rather than pour another Intel bottle for it.
+      - name: Restore the Pinned Intel Kegs
+        run: contrib/devtools/macos-restore-pinned-kegs.sh contrib/devtools/macos-pinned-kegs.txt
+
+      # Informational: the restore step has already verified each version.
+      - name: Record Dependency Versions
+        run: |
+          {
+            echo "### macOS Intel versions"
+            echo '```'
+            brew list --versions qt@5 boost openssl@3 miniupnpc qrencode || true
+            echo "in use: Qt $("$(brew --prefix qt@5)/bin/qmake" -query QT_VERSION), $("$(brew --prefix openssl@3)/bin/openssl" version)"
+            echo "$(clang --version | sed -n 1p); $(cmake --version | sed -n 1p); ccache: $(command -v ccache || echo none)"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure Ccache
+        uses: actions/cache@v5
+        with:
+          path: /Users/runner/Library/Caches/ccache
+          key: ccache-macos-intel-${{ github.sha }}
+          restore-keys: ccache-macos-intel-
+
+      - name: Setup Concurrency
+        run: |
+          if [ -z "$CMAKE_BUILD_PARALLEL_LEVEL" ]; then
+            CORES=$(sysctl -n hw.logicalcpu)
+            echo "CMAKE_BUILD_PARALLEL_LEVEL=$CORES" >> $GITHUB_ENV
+            echo "CTEST_PARALLEL_LEVEL=$CORES" >> $GITHUB_ENV
+            echo "Concurrency: Auto-detected $CORES cores."
+          else
+            echo "Concurrency: Limit set externally to $CMAKE_BUILD_PARALLEL_LEVEL."
+          fi
+
+      # Inert without the secrets, as in the arm64 job.
+      - name: Import Code Signing Certificate
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE_P12" ]; then
+            echo "No signing certificate configured, skipping import."
+            exit 0
+          fi
+
+          KEYCHAIN_PATH="${RUNNER_TEMP}/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          CERT_PATH="${RUNNER_TEMP}/certificate.p12"
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          rm -f "$CERT_PATH"
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
+
+      - name: Set Signing Identity
+        run: |
+          if [ -n "$IDENTITY" ]; then
+            echo "APPLE_SIGNING_IDENTITY=$IDENTITY" >> $GITHUB_ENV
+            echo "Signing identity configured."
+          else
+            echo "No signing identity configured, will use ad-hoc signing."
+          fi
+        env:
+          IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+
+      - name: Configure CMake
+        run: |
+          launcher=()
+          if command -v ccache >/dev/null 2>&1; then
+            launcher=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+          else
+            echo "ccache not found; building without it."
+          fi
+          cmake -B build \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix qt@5)" \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" \
+            -DENABLE_GUI=ON \
+            -DENABLE_QRENCODE=ON \
+            -DENABLE_UPNP=ON \
+            -DDEFAULT_UPNP=ON \
+            -DENABLE_PIE=ON \
+            -DENABLE_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            "${launcher[@]}"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        # See the arm64 job: bounded twice so a hang is reported rather than
+        # running to the six-hour job default.
+        timeout-minutes: 45
+        run: ctest --test-dir build --output-on-failure --timeout 1800
+
+      - name: Dump crash reports on test failure
+        # See the arm64 job.
+        if: failure()
+        run: |
+          echo "=== DiagnosticReports ==="
+          ls -la ~/Library/Logs/DiagnosticReports/ 2>/dev/null || echo "  (none)"
+          for f in ~/Library/Logs/DiagnosticReports/*pink2* ~/Library/Logs/DiagnosticReports/*Pinkcoin*; do
+            [ -e "$f" ] || continue
+            echo "---------- $f"
+            head -c 20000 "$f"
+            echo
+          done
+
+      - name: Smoke Test
+        run: .github/scripts/smoke.sh build/bin/pink2d
+
+      - name: Package (DMG)
+        run: cmake --build build --target deploy
+
+      # See the arm64 job.
+      - name: Verify DMG Package
+        run: |
+          shopt -s nullglob
+          dmgs=(build/Pinkcoin-macOS-"$MACOS_ARCH"-*.dmg)
+          if [ "${#dmgs[@]}" -ne 1 ]; then
+            echo "::error::expected one build/Pinkcoin-macOS-$MACOS_ARCH-*.dmg, found ${#dmgs[@]}"
+            printf '%s\n' build/*.dmg
+            exit 1
+          fi
+          dmg="${dmgs[0]}"
+          mnt="${RUNNER_TEMP}/pinkcoin-dmg"
+          mkdir -p "$mnt"
+          hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mnt"
+          trap 'hdiutil detach "$mnt" || hdiutil detach -force "$mnt" || true' EXIT
+          contrib/devtools/check-macos-bundle.sh "$mnt/Pinkcoin-Qt.app" "$MACOS_DEPLOYMENT_TARGET"
+          codesign --verify --strict --verbose=2 "$mnt/Pinkcoin-Qt.app"
+          mkdir -p dist
+          cp "$dmg" dist/
+          echo "DMG_NAME=$(basename "$dmg")" >> "$GITHUB_ENV"
+
+      # See the arm64 job.
+      - name: Package pink2d
+        run: |
+          tarball="dist/${DMG_NAME%.dmg}-pink2d.tar.xz"
+          COPYFILE_DISABLE=1 tar -C build/bin -cJf "$tarball" pink2d
+          listing=$(tar -tJf "$tarball")
+          if [ "$listing" != pink2d ]; then
+            echo "::error::$tarball should hold only pink2d; it holds: $listing"
+            exit 1
+          fi
+          unpacked="${RUNNER_TEMP}/pink2d-check"
+          rm -rf "$unpacked"
+          mkdir -p "$unpacked"
+          tar -C "$unpacked" -xJf "$tarball"
+          contrib/devtools/check-macos-binary.sh "$unpacked/pink2d" "$MACOS_DEPLOYMENT_TARGET"
+          ls -la dist
+
+      - name: Upload Artifacts
+        if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: pinkcoin-macos-intel
+          path: dist/
+          if-no-files-found: error
+          retention-days: 5
+
+      - name: Cleanup Signing Keychain
+        if: ${{ always() && env.KEYCHAIN_PATH != '' }}
+        run: security delete-keychain "$KEYCHAIN_PATH" || true
+
+  # ----------------------------------------------------------------------
+  # JOB 3: Deploy (draft GitHub Release, or the dry run's artifact)
+  # ----------------------------------------------------------------------
+  deploy:
+    name: Release Assets
+    # EVERY job that uploads a pinkcoin-* artifact must be listed here.
+    # download-artifact takes whatever exists at the moment it runs, so a
+    # producer missing from this list is a race: if it finishes after this job,
+    # its asset is silently absent. The asset check below backs this up.
+    needs: [depends-builds, macos-native-arm64, macos-native-intel]
+    # Tag pushes only, not a manual run on a tag, publish; a manual run asked
+    # for a dry run collects the assets and publishes nothing.
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.dry_run_release)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # For src/clientversion.h, the version every asset is named for.
+      - uses: actions/checkout@v5
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+          pattern: pinkcoin-*
+
+      - name: Assemble Release Assets
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          part() { sed -n "s/^#define CLIENT_VERSION_$1[[:space:]][[:space:]]*\([0-9][0-9]*\).*/\1/p" src/clientversion.h; }
+          VERSION="$(part MAJOR).$(part MINOR).$(part REVISION).$(part BUILD)"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::could not read the version from src/clientversion.h (got '$VERSION')"
+            exit 1
+          fi
+          # A release's tag and its assets must name the same version.
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "$VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match src/clientversion.h's version $VERSION"
+            exit 1
+          fi
+
+          expected=(
+            "Pinkcoin-Linux-$VERSION.tar.xz"
+            "Pinkcoin-Win64-$VERSION.zip"
+            "Pinkcoin-macOS-arm64-$VERSION.dmg"
+            "Pinkcoin-macOS-x86_64-$VERSION.dmg"
+            "Pinkcoin-macOS-arm64-$VERSION-pink2d.tar.xz"
+            "Pinkcoin-macOS-x86_64-$VERSION-pink2d.tar.xz"
+          )
+
+          # Copy every artifact's files in, refusing a name two artifacts share.
+          mkdir -p release_assets
+          shopt -s nullglob
+          files=(artifacts/pinkcoin-*/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no pinkcoin-* artifacts were downloaded; nothing to release."
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            if [ -e "release_assets/$(basename "$f")" ]; then
+              echo "::error::two artifacts hold $(basename "$f")"
+              exit 1
+            fi
+            cp "$f" release_assets/
+          done
+
+          cd release_assets
+          # Exactly the expected set: nothing missing, nothing extra.
+          mapfile -t sorted < <(printf '%s\n' "${expected[@]}" | sort)
+          want=$(printf '%s\n' "${sorted[@]}")
+          got=$(find . -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+          if [ "$got" != "$want" ]; then
+            echo "::error::the release assets are not the expected set for $VERSION"
+            diff <(echo "$want") <(echo "$got") || true
+            exit 1
+          fi
+
+          sha256sum "${sorted[@]}" > SHA256SUMS
+          ls -la
+          {
+            echo "### Release assets for $VERSION"
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish Draft Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_assets/*
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+      # The dry run's result: the seven files a release would carry. Kept longer
+      # than the build artifacts, since it can be the release gate's input.
+      - name: Upload Release Assets (dry run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v5
+        with:
+          name: release-assets
+          path: release_assets/
+          if-no-files-found: error
+          retention-days: 30
