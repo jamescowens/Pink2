@@ -1,0 +1,50 @@
+# Pinned Homebrew kegs for the Intel macOS CI job.
+#
+# Homebrew has wound x86_64 macOS down to Tier 3. A formula with no Intel
+# bottle is source-built on the runner, which takes hours for Qt and gives the
+# binary the RUNNER's macOS as its minimum; a formula that publishes an Intel
+# bottle for a newer macOS tag pours that one. Either way a library that needs
+# macOS 15 lands inside a bundle that claims 14.0, and dyld refuses to load it
+# on macOS 14. qt@5 is also disabled by Homebrew from 2027-05-19.
+#
+# So the Intel job does not take these from Homebrew at all. Each keg is a tar
+# of Cellar/<name>/<version> from one native Intel macOS 14 machine, mirrored
+# under homebrew-kegs/sonoma-x86_64/pink2/ in the Gridcoin depends bucket, and
+# macos-restore-pinned-kegs.sh restores exactly these.
+#
+# The set is self-contained, measured on the mirrored objects: none of the
+# libraries Pink2 links (Boost chrono/filesystem/program_options/thread and
+# what they load, libssl.3, libcrypto.3, libminiupnpc, libqrencode, the qt@5
+# frameworks and plugins) references a Homebrew library outside these five
+# kegs. The restore script checks that again on every run, from the tarballs,
+# before it touches Homebrew. That is why there is no dependency-closure
+# install: `brew deps qt@5` names 18 formulae, none of which the qt@5 5.15.2
+# keg (a 2021 bottle, built on 10.15) actually loads. If a new version here
+# references something outside the set, the check fails and names it; add that
+# formula's keg, built on the same machine.
+#
+# The four besides qt@5 are the same objects Gridcoin's manifest pins, by the
+# same sha256. They sit under Pink2's own prefix so that a Gridcoin keg refresh
+# cannot change what Pink2 builds against.
+#
+# Each entry is <name> <version> <sha256>. The hash is not optional: these are
+# release inputs fetched from a mutable object store, and a version alone does
+# not authenticate them.
+#
+# TO UPGRADE: upgrade the formula on that machine, tar the keg from the Cellar
+# as <name>--<version>.tar.gz (paths <name>/<version>/...), upload it under
+# homebrew-kegs/<built_on>/pink2/, then update BOTH the version and the hash
+# here. A signed PUT must percent-encode '@' (qt%405--...) or S3 rejects the
+# signature; GET works with either spelling.
+#
+# built_on is the macOS the kegs were compiled on (or poured on). It must be
+# <= the runner's macOS: older-on-newer works, newer-on-older does not. The
+# bundle check (check-macos-bundle.sh) measures the real floor of the DMG.
+
+built_on        sonoma-x86_64
+
+boost           1.90.0_1 8f051e9c38a7137d2e4904e6bdfc2723525002b246424a20a61651784782ff08
+openssl@3       3.6.3    45142a82c589caac92ffe544c02b27d8c28e8b42ef99d70083ab84955a0228d3
+miniupnpc       2.3.3    a26989050b10d15321d420fab01149dfa07d4f05505247d4173f1d8e5bf186a2
+qrencode        4.1.1    21fc53ddea51ce44ec19485ea6127c210d839b3cd16ed7b75f6d44b4b024b274
+qt@5            5.15.2   994390b4ea3563740b84d8b66752ddf18bb6bb121a21a2bd2ccb008316112e6c

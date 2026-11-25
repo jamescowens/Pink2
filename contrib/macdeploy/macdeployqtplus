@@ -1,5 +1,4 @@
-#!/usr/bin/env python
-
+#!/usr/bin/env python3
 #
 # Copyright (C) 2011  Patrick "p2k" Schneider <me@p2k-network.org>
 #
@@ -17,11 +16,34 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
-import subprocess, sys, re, os, shutil, stat, os.path, time
-from string import Template
+import sys, re, os, platform, shutil, stat, subprocess, os.path, time
 from argparse import ArgumentParser
+try:
+    from ds_store import DSStore
+    from mac_alias import Alias
+    HAS_DS_STORE = True
+except ImportError:
+    HAS_DS_STORE = False
+from pathlib import Path
+from subprocess import CalledProcessError, PIPE, run
+from typing import List, Optional
 
-# This is ported from the original macdeployqt with modifications
+# Line-buffer stdout. Run from make, stdout is a pipe and block-buffered,
+# while the tools this script runs write straight to the log, so a progress
+# or retry message could land far from the error it belongs to.
+sys.stdout.reconfigure(line_buffering=True)
+
+# This is ported from the original macdeployqt with modifications.
+#
+# Pinkcoin: taken from Gridcoin's copy (Qt 6) and used with Homebrew's qt@5
+# 5.15, whose layout it already handles (framework binaries under Versions/5,
+# plugins/ and translations/ under the prefix, absolute install names). The
+# changes are the bundle's names, the plugins Pinkcoin-Qt needs, bundle-relative
+# ids for the deployed plugins, and Qt 5's meta translation catalogs.
+
+# The bundle's main executable (CFBundleExecutable), as 2.4.0.0 shipped it.
+BUNDLE_EXECUTABLE = "Pinkcoin-Qt"
+BUNDLE_NAME = BUNDLE_EXECUTABLE + ".app"
 
 class FrameworkInfo(object):
     def __init__(self):
@@ -41,124 +63,116 @@ class FrameworkInfo(object):
         self.sourceContentsDirectory = ""
         self.destinationResourcesDirectory = ""
         self.destinationVersionContentsDirectory = ""
-    
+
     def __eq__(self, other):
         if self.__class__ == other.__class__:
             return self.__dict__ == other.__dict__
         else:
             return False
-    
+
     def __str__(self):
-        return """ Framework name: %s
- Framework directory: %s
- Framework path: %s
- Binary name: %s
- Binary directory: %s
- Binary path: %s
- Version: %s
- Install name: %s
- Deployed install name: %s
- Source file Path: %s
- Deployed Directory (relative to bundle): %s
-""" % (self.frameworkName,
-       self.frameworkDirectory,
-       self.frameworkPath,
-       self.binaryName,
-       self.binaryDirectory,
-       self.binaryPath,
-       self.version,
-       self.installName,
-       self.deployedInstallName,
-       self.sourceFilePath,
-       self.destinationDirectory)
-    
+        return f""" Framework name: {self.frameworkName}
+ Framework directory: {self.frameworkDirectory}
+ Framework path: {self.frameworkPath}
+ Binary name: {self.binaryName}
+ Binary directory: {self.binaryDirectory}
+ Binary path: {self.binaryPath}
+ Version: {self.version}
+ Install name: {self.installName}
+ Deployed install name: {self.deployedInstallName}
+ Source file Path: {self.sourceFilePath}
+ Deployed Directory (relative to bundle): {self.destinationDirectory}
+"""
+
     def isDylib(self):
         return self.frameworkName.endswith(".dylib")
-    
+
     def isQtFramework(self):
         if self.isDylib():
             return self.frameworkName.startswith("libQt")
         else:
             return self.frameworkName.startswith("Qt")
-    
+
     reOLine = re.compile(r'^(.+) \(compatibility version [0-9.]+, current version [0-9.]+\)$')
     bundleFrameworkDirectory = "Contents/Frameworks"
     bundleBinaryDirectory = "Contents/MacOS"
-    
+
     @classmethod
-    def fromOtoolLibraryLine(cls, line):
+    def fromLibraryLine(cls, line: str) -> Optional['FrameworkInfo']:
         # Note: line must be trimmed
         if line == "":
             return None
-        
-        # Don't deploy system libraries (exception for libQtuitools and libQtlucene).
-        if line.startswith("/System/Library/") or line.startswith("@executable_path") or (line.startswith("/usr/lib/") and "libQt" not in line):
+
+        # Don't deploy system libraries
+        if line.startswith("/System/Library/") or line.startswith("@executable_path") or line.startswith("/usr/lib/"):
             return None
-        
+
         m = cls.reOLine.match(line)
         if m is None:
-            raise RuntimeError("otool line could not be parsed: " + line)
-        
-        path = m.group(1)
-        
+            raise RuntimeError(f"Line could not be parsed: {line}")
+
+        # Normalize the path to collapse any '..' traversals that may arise
+        # from @rpath or @loader_path expansion in different directory layouts.
+        path = os.path.normpath(m.group(1))
+
         info = cls()
         info.sourceFilePath = path
         info.installName = path
-        
+
         if path.endswith(".dylib"):
             dirname, filename = os.path.split(path)
             info.frameworkName = filename
             info.frameworkDirectory = dirname
             info.frameworkPath = path
-            
+
             info.binaryDirectory = dirname
             info.binaryName = filename
             info.binaryPath = path
             info.version = "-"
-            
+
             info.installName = path
-            info.deployedInstallName = "@executable_path/../Frameworks/" + info.binaryName
+            info.deployedInstallName = f"@executable_path/../Frameworks/{info.binaryName}"
             info.sourceFilePath = path
             info.destinationDirectory = cls.bundleFrameworkDirectory
         else:
             parts = path.split("/")
-            i = 0
-            # Search for the .framework directory
-            for part in parts:
+            # Search for the LAST .framework directory. When relative rpaths
+            # are expanded, the path may traverse through a sibling framework
+            # directory before reaching the actual dependency. Using the last
+            # match ensures we identify the correct dependency framework.
+            i = -1
+            for j, part in enumerate(parts):
                 if part.endswith(".framework"):
-                    break
-                i += 1
-            if i == len(parts):
-                raise RuntimeError("Could not find .framework or .dylib in otool line: " + line)
-            
+                    i = j
+            if i == -1:
+                raise RuntimeError(f"Could not find .framework or .dylib in line: {line}")
+
             info.frameworkName = parts[i]
             info.frameworkDirectory = "/".join(parts[:i])
             info.frameworkPath = os.path.join(info.frameworkDirectory, info.frameworkName)
-            
+
             info.binaryName = parts[i+3]
             info.binaryDirectory = "/".join(parts[i+1:i+3])
             info.binaryPath = os.path.join(info.binaryDirectory, info.binaryName)
             info.version = parts[i+2]
-            
-            info.deployedInstallName = "@executable_path/../Frameworks/" + os.path.join(info.frameworkName, info.binaryPath)
+
+            info.deployedInstallName = f"@executable_path/../Frameworks/{os.path.join(info.frameworkName, info.binaryPath)}"
             info.destinationDirectory = os.path.join(cls.bundleFrameworkDirectory, info.frameworkName, info.binaryDirectory)
-            
+
             info.sourceResourcesDirectory = os.path.join(info.frameworkPath, "Resources")
             info.sourceContentsDirectory = os.path.join(info.frameworkPath, "Contents")
             info.sourceVersionContentsDirectory = os.path.join(info.frameworkPath, "Versions", info.version, "Contents")
             info.destinationResourcesDirectory = os.path.join(cls.bundleFrameworkDirectory, info.frameworkName, "Resources")
-            info.destinationContentsDirectory = os.path.join(cls.bundleFrameworkDirectory, info.frameworkName, "Contents")
             info.destinationVersionContentsDirectory = os.path.join(cls.bundleFrameworkDirectory, info.frameworkName, "Versions", info.version, "Contents")
-        
+
         return info
 
 class ApplicationBundleInfo(object):
-    def __init__(self, path):
+    def __init__(self, path: str):
         self.path = path
-        appName = os.path.splitext(os.path.basename(path))[0]
-        self.binaryPath = os.path.join(path, "Contents", "MacOS", appName)
+        self.binaryPath = os.path.join(path, "Contents", "MacOS", BUNDLE_EXECUTABLE)
         if not os.path.exists(self.binaryPath):
-            raise RuntimeError("Could not find bundle binary for " + path)
+            raise RuntimeError(f"Could not find bundle binary for {path}")
         self.resourcesPath = os.path.join(path, "Contents", "Resources")
         self.pluginPath = os.path.join(path, "Contents", "PlugIns")
 
@@ -167,441 +181,551 @@ class DeploymentInfo(object):
         self.qtPath = None
         self.pluginPath = None
         self.deployedFrameworks = []
-    
-    def detectQtPath(self, frameworkDirectory):
+
+    def detectQtPath(self, frameworkDirectory: str):
         parentDir = os.path.dirname(frameworkDirectory)
         if os.path.exists(os.path.join(parentDir, "translations")):
             # Classic layout, e.g. "/usr/local/Trolltech/Qt-4.x.x"
             self.qtPath = parentDir
-        elif os.path.exists(os.path.join(parentDir, "share", "qt4", "translations")):
-            # MacPorts layout, e.g. "/opt/local/share/qt4"
-            self.qtPath = os.path.join(parentDir, "share", "qt4")
-        elif os.path.exists(os.path.join(os.path.dirname(parentDir), "share", "qt4", "translations")):
-            # Newer Macports layout
-            self.qtPath = os.path.join(os.path.dirname(parentDir), "share", "qt4")
         else:
             self.qtPath = os.getenv("QTDIR", None)
 
         if self.qtPath is not None:
-            pluginPath = os.path.join(self.qtPath, "plugins")
-            if os.path.exists(pluginPath):
-                self.pluginPath = pluginPath
-    
-    def usesFramework(self, name):
-        nameDot = "%s." % name
-        libNameDot = "lib%s." % name
+            # Try common plugin directory layouts:
+            #   Classic Qt, Homebrew qt@5:  ${prefix}/plugins
+            #   Homebrew Qt6:               ${prefix}/share/qt/plugins
+            for candidate in [
+                os.path.join(self.qtPath, "plugins"),
+                os.path.join(self.qtPath, "share", "qt", "plugins"),
+            ]:
+                if os.path.exists(candidate):
+                    self.pluginPath = candidate
+                    break
+
+    def usesFramework(self, name: str) -> bool:
         for framework in self.deployedFrameworks:
             if framework.endswith(".framework"):
-                if framework.startswith(nameDot):
+                if framework.startswith(f"{name}."):
                     return True
             elif framework.endswith(".dylib"):
-                if framework.startswith(libNameDot):
+                if framework.startswith(f"lib{name}."):
                     return True
         return False
 
-def getFrameworks(binaryPath, verbose):
-    if verbose >= 3:
-        print "Inspecting with otool: " + binaryPath
-    otoolbin=os.getenv("OTOOL", "otool")
-    otool = subprocess.Popen([otoolbin, "-L", binaryPath], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    o_stdout, o_stderr = otool.communicate()
-    if otool.returncode != 0:
-        if verbose >= 1:
-            sys.stderr.write(o_stderr)
-            sys.stderr.flush()
-            raise RuntimeError("otool failed with return code %d" % otool.returncode)
-    
-    otoolLines = o_stdout.split("\n")
-    otoolLines.pop(0) # First line is the inspected binary
+def getRpaths(binaryPath: str, verbose: int) -> List[str]:
+    """Extract LC_RPATH search paths from a Mach-O binary using otool."""
+    output = run(["otool", "-l", binaryPath], stdout=PIPE, stderr=PIPE, text=True)
+    if output.returncode != 0:
+        return []
+    rpaths = []
+    lines = output.stdout.split("\n")
+    for i, line in enumerate(lines):
+        if "cmd LC_RPATH" in line:
+            for j in range(i + 1, min(i + 4, len(lines))):
+                if "path " in lines[j]:
+                    rp = lines[j].strip().split("path ")[1].split(" (offset")[0].strip()
+                    rpaths.append(rp)
+                    break
+    if verbose and rpaths:
+        print(f"  rpaths for {binaryPath}: {rpaths}")
+    return rpaths
+
+def expandRpathTokens(rpath: str, binaryPath: str) -> str:
+    """Expand @loader_path and @executable_path tokens in an rpath entry."""
+    rpath = rpath.replace("@loader_path", os.path.dirname(binaryPath))
+    rpath = rpath.replace("@executable_path", os.path.dirname(binaryPath))
+    return rpath
+
+def resolveRpath(line: str, rpaths: List[str], binaryPath: str) -> Optional[str]:
+    """Try to resolve an @rpath reference using extracted rpaths.
+
+    Returns the line with @rpath replaced by the matching rpath,
+    or None if no rpath resolves to an existing path.
+    Expands @loader_path/@executable_path tokens within rpath entries.
+    """
+    for rp in rpaths:
+        rp = expandRpathTokens(rp, binaryPath)
+        candidate = line.replace("@rpath", rp)
+        stripped = candidate.strip()
+        m = FrameworkInfo.reOLine.match(stripped)
+        if m:
+            # Normalize the path to collapse '..' traversals. Without this,
+            # relative rpaths expanded in a bundle context can produce paths
+            # that pass through a sibling .framework directory (e.g.
+            # .../QtGui.framework/Versions/A/../../QtCore.framework/...).
+            # The old first-match .framework check would then find the wrong
+            # framework and accept a bogus candidate.
+            path = os.path.normpath(m.group(1))
+            if os.path.exists(path):
+                # Reconstruct the line with the normalized path so downstream
+                # parsing sees a clean path without '..' components.
+                version_info = stripped[len(m.group(1)):]
+                return f"  {path}{version_info}"
+    return None
+
+def getFrameworks(binaryPath: str, verbose: int) -> List[FrameworkInfo]:
+    objdump = os.getenv("OBJDUMP", "objdump")
+    if verbose:
+        print(f"Inspecting with {objdump}: {binaryPath}")
+    output = run([objdump, "--macho", "--dylibs-used", binaryPath], stdout=PIPE, stderr=PIPE, text=True)
+    if output.returncode != 0:
+        sys.stderr.write(output.stderr)
+        sys.stderr.flush()
+        raise RuntimeError(f"{objdump} failed with return code {output.returncode}")
+
+    lines = output.stdout.split("\n")
+    lines.pop(0) # First line is the inspected binary
     if ".framework" in binaryPath or binaryPath.endswith(".dylib"):
-        otoolLines.pop(0) # Frameworks and dylibs list themselves as a dependency.
-    
+        lines.pop(0) # Frameworks and dylibs list themselves as a dependency.
+
+    # Extract rpaths for resolving @rpath references
+    rpaths = getRpaths(binaryPath, verbose)
+
     libraries = []
-    for line in otoolLines:
+    for line in lines:
+        # Extract the raw install name before any token resolution.
+        # install_name_tool -change must match the exact string in the binary.
+        raw_match = FrameworkInfo.reOLine.match(line.strip())
+        raw_installname = raw_match.group(1) if raw_match else None
+
         line = line.replace("@loader_path", os.path.dirname(binaryPath))
-        info = FrameworkInfo.fromOtoolLibraryLine(line.strip())
+        if "@rpath/" in line:
+            resolved = resolveRpath(line, rpaths, binaryPath)
+            if resolved is not None:
+                line = resolved
+            else:
+                if verbose:
+                    print(f"  Skipping unresolvable @rpath reference: {line.strip()}")
+                continue
+        info = FrameworkInfo.fromLibraryLine(line.strip())
         if info is not None:
-            if verbose >= 3:
-                print "Found framework:"
-                print info
+            # Restore the original install name so that install_name_tool -change
+            # can match the actual reference in the binary (e.g. @rpath/... or
+            # @loader_path/...) rather than the resolved absolute path.
+            if raw_installname and raw_installname != info.installName:
+                info.installName = raw_installname
+            if verbose:
+                print("Found framework:")
+                print(info)
             libraries.append(info)
-    
+
     return libraries
 
-def runInstallNameTool(action, *args):
-    installnametoolbin=os.getenv("INSTALLNAMETOOL", "install_name_tool")
-    subprocess.check_call([installnametoolbin, "-"+action] + list(args))
+QM_MAGIC = bytes([0x3c, 0xb8, 0x64, 0x18, 0xca, 0xef, 0x9c, 0x95,
+                  0xcd, 0x21, 0x1c, 0xbf, 0x60, 0xa1, 0xbd, 0xdd])
+QM_TAG_DEPENDENCIES = 0x96
 
-def changeInstallName(oldName, newName, binaryPath, verbose):
-    if verbose >= 3:
-        print "Using install_name_tool:"
-        print " in", binaryPath
-        print " change reference", oldName
-        print " to", newName
+def qmDependencies(path: Path) -> List[str]:
+    """The catalog names a .qm file depends on (its Dependencies block)."""
+    data = path.read_bytes()
+    if not data.startswith(QM_MAGIC):
+        raise RuntimeError(f"{path} is not a Qt translation file")
+    deps = []
+    pos = len(QM_MAGIC)
+    while pos + 5 <= len(data):
+        tag = data[pos]
+        length = int.from_bytes(data[pos + 1:pos + 5], "big")
+        body = data[pos + 5:pos + 5 + length]
+        pos += 5 + length
+        if tag != QM_TAG_DEPENDENCIES:
+            continue
+        i = 0
+        while i + 4 <= len(body):
+            n = int.from_bytes(body[i:i + 4], "big")
+            deps.append(body[i + 4:i + 4 + n].decode("utf-16-be"))
+            i += 4 + n
+    return deps
+
+def qmClosure(directory: Path, name: str):
+    """(files to copy, missing catalogs) for translation file `name` in `directory`."""
+    closure, missing, todo = [], [], [name]
+    while todo:
+        current = todo.pop(0)
+        if current in closure:
+            continue
+        path = directory / current
+        if not path.is_file():
+            missing.append(current)
+            continue
+        closure.append(current)
+        todo.extend(f"{dep}.qm" for dep in qmDependencies(path))
+    return closure, missing
+
+def runInstallNameTool(action: str, *args):
+    installnametoolbin=os.getenv("INSTALLNAMETOOL", "install_name_tool")
+    run([installnametoolbin, "-"+action] + list(args), check=True)
+
+def changeInstallName(oldName: str, newName: str, binaryPath: str, verbose: int):
+    if verbose:
+        print("Using install_name_tool:")
+        print(" in", binaryPath)
+        print(" change reference", oldName)
+        print(" to", newName)
     runInstallNameTool("change", oldName, newName, binaryPath)
 
-def changeIdentification(id, binaryPath, verbose):
-    if verbose >= 3:
-        print "Using install_name_tool:"
-        print " change identification in", binaryPath
-        print " to", id
+def changeIdentification(id: str, binaryPath: str, verbose: int):
+    if verbose:
+        print("Using install_name_tool:")
+        print(" change identification in", binaryPath)
+        print(" to", id)
     runInstallNameTool("id", id, binaryPath)
 
-def runStrip(binaryPath, verbose):
+def runStrip(binaryPath: str, verbose: int):
     stripbin=os.getenv("STRIP", "strip")
-    if verbose >= 3:
-        print "Using strip:"
-        print " stripped", binaryPath
-    subprocess.check_call([stripbin, "-x", binaryPath])
+    if verbose:
+        print("Using strip:")
+        print(" stripped", binaryPath)
+    run([stripbin, "-x", binaryPath], check=True)
 
-def copyFramework(framework, path, verbose):
+def codesignItem(path: str, identity: str, entitlements: Optional[str],
+                  hardened: bool, verbose: int):
+    """Sign a single binary, dylib, framework, or bundle."""
+    if platform.system() != "Darwin":
+        return
+    cmd = ["codesign", "--force", "--sign", identity, "--timestamp"]
+    if hardened:
+        cmd.append("--options=runtime")
+    if entitlements:
+        cmd.extend(["--entitlements", entitlements])
+    cmd.append(path)
+    if verbose:
+        print("  codesign:", " ".join(cmd))
+    # --timestamp has Apple's timestamp server countersign the signature, so
+    # signing fails whenever that server does not answer: "A timestamp was
+    # expected but was not found." Observed on a macos-15-intel runner, on the
+    # first framework signed. Retry it the way the hdiutil calls below are
+    # retried; --force, already passed, makes a retry replace any signature
+    # an earlier attempt wrote. The final attempt raises like check_call would.
+    attempts, delay = 4, 15
+    for attempt in range(1, attempts + 1):
+        result = run(cmd)
+        if result.returncode == 0:
+            return
+        if attempt < attempts:
+            print(f"codesign {path} failed (attempt {attempt}/{attempts}), retrying in {delay}s...")
+            time.sleep(delay)
+    result.check_returncode()
+
+def copyFramework(framework: FrameworkInfo, path: str, verbose: int) -> Optional[str]:
     if framework.sourceFilePath.startswith("Qt"):
         #standard place for Nokia Qt installer's frameworks
-        fromPath = "/Library/Frameworks/" + framework.sourceFilePath
+        fromPath = f"/Library/Frameworks/{framework.sourceFilePath}"
     else:
         fromPath = framework.sourceFilePath
     toDir = os.path.join(path, framework.destinationDirectory)
     toPath = os.path.join(toDir, framework.binaryName)
-    
-    if not os.path.exists(fromPath):
-        raise RuntimeError("No file at " + fromPath)
-    
-    if os.path.exists(toPath):
-        return None # Already there
-    
-    if not os.path.exists(toDir):
-        os.makedirs(toDir)
-    
-    shutil.copy2(fromPath, toPath)
-    if verbose >= 3:
-        print "Copied:", fromPath
-        print " to:", toPath
+
+    if framework.isDylib():
+        if not os.path.exists(fromPath):
+            raise RuntimeError(f"No file at {fromPath}")
+
+        if os.path.exists(toPath):
+            return None # Already there
+
+        if not os.path.exists(toDir):
+            os.makedirs(toDir)
+
+        shutil.copy2(fromPath, toPath)
+        if verbose:
+            print("Copied:", fromPath)
+            print(" to:", toPath)
+    else:
+        to_dir = os.path.join(path, "Contents", "Frameworks", framework.frameworkName)
+        if os.path.exists(to_dir):
+            return None # Already there
+
+        from_dir = framework.frameworkPath
+        if not os.path.exists(from_dir):
+            raise RuntimeError(f"No directory at {from_dir}")
+
+        shutil.copytree(from_dir, to_dir, symlinks=True)
+        if verbose:
+            print("Copied:", from_dir)
+            print(" to:", to_dir)
+
+        headers_link = os.path.join(to_dir, "Headers")
+        if os.path.exists(headers_link):
+            os.unlink(headers_link)
+
+        headers_dir = os.path.join(to_dir, framework.binaryDirectory, "Headers")
+        if os.path.exists(headers_dir):
+            shutil.rmtree(headers_dir)
+
+        # Seal the framework root: codesign refuses a framework whose root
+        # holds real entries other than Versions ("unsealed contents present
+        # in the root directory of an embedded framework"). Bottled Qt kegs
+        # ship clean roots, but source-built kegs -- what Homebrew now
+        # produces on Intel under its Tier 3 fallback -- can leave real
+        # files or directories (build artifacts such as .prl files) at the
+        # root. Re-home them under the versioned directory and leave the
+        # symlink the sealed layout expects.
+        versions_dir = os.path.join(to_dir, "Versions")
+        if os.path.isdir(versions_dir):
+            versioned_root = os.path.join(versions_dir, framework.version)
+            for entry in os.listdir(to_dir):
+                if entry == "Versions":
+                    continue
+                entry_path = os.path.join(to_dir, entry)
+                if os.path.islink(entry_path):
+                    continue
+                versioned_path = os.path.join(versioned_root, entry)
+                if os.path.exists(versioned_path):
+                    if os.path.isdir(entry_path):
+                        shutil.rmtree(entry_path)
+                    else:
+                        os.remove(entry_path)
+                else:
+                    shutil.move(entry_path, versioned_path)
+                os.symlink(os.path.join("Versions", framework.version, entry), entry_path)
+                if verbose:
+                    print("Sealed framework root entry:", entry)
 
     permissions = os.stat(toPath)
     if not permissions.st_mode & stat.S_IWRITE:
       os.chmod(toPath, permissions.st_mode | stat.S_IWRITE)
 
-    if not framework.isDylib(): # Copy resources for real frameworks
-
-        linkfrom = os.path.join(path, "Contents","Frameworks", framework.frameworkName, "Versions", "Current")
-        linkto = framework.version
-        if not os.path.exists(linkfrom):
-            os.symlink(linkto, linkfrom)
-            if verbose >= 2:
-                print "Linked:", linkfrom, "->", linkto
-        fromResourcesDir = framework.sourceResourcesDirectory
-        if os.path.exists(fromResourcesDir):
-            toResourcesDir = os.path.join(path, framework.destinationResourcesDirectory)
-            shutil.copytree(fromResourcesDir, toResourcesDir, symlinks=True)
-            if verbose >= 3:
-                print "Copied resources:", fromResourcesDir
-                print " to:", toResourcesDir
-        fromContentsDir = framework.sourceVersionContentsDirectory
-        if not os.path.exists(fromContentsDir):
-            fromContentsDir = framework.sourceContentsDirectory
-        if os.path.exists(fromContentsDir):
-            toContentsDir = os.path.join(path, framework.destinationVersionContentsDirectory)
-            shutil.copytree(fromContentsDir, toContentsDir, symlinks=True)
-            contentslinkfrom = os.path.join(path, framework.destinationContentsDirectory)
-            if verbose >= 3:
-                print "Copied Contents:", fromContentsDir
-                print " to:", toContentsDir
-    elif framework.frameworkName.startswith("libQtGui"): # Copy qt_menu.nib (applies to non-framework layout)
-        qtMenuNibSourcePath = os.path.join(framework.frameworkDirectory, "Resources", "qt_menu.nib")
-        qtMenuNibDestinationPath = os.path.join(path, "Contents", "Resources", "qt_menu.nib")
-        if os.path.exists(qtMenuNibSourcePath) and not os.path.exists(qtMenuNibDestinationPath):
-            shutil.copytree(qtMenuNibSourcePath, qtMenuNibDestinationPath, symlinks=True)
-            if verbose >= 3:
-                print "Copied for libQtGui:", qtMenuNibSourcePath
-                print " to:", qtMenuNibDestinationPath
-    
     return toPath
 
-def deployFrameworks(frameworks, bundlePath, binaryPath, strip, verbose, deploymentInfo=None):
+def deployFrameworks(frameworks: List[FrameworkInfo], bundlePath: str, binaryPath: str, strip: bool, verbose: int, deploymentInfo: Optional[DeploymentInfo] = None) -> DeploymentInfo:
     if deploymentInfo is None:
         deploymentInfo = DeploymentInfo()
-    
+
     while len(frameworks) > 0:
         framework = frameworks.pop(0)
         deploymentInfo.deployedFrameworks.append(framework.frameworkName)
-        
-        if verbose >= 2:
-            print "Processing", framework.frameworkName, "..."
-        
+
+        print("Processing", framework.frameworkName, "...")
+
         # Get the Qt path from one of the Qt frameworks
         if deploymentInfo.qtPath is None and framework.isQtFramework():
             deploymentInfo.detectQtPath(framework.frameworkDirectory)
-        
+
         if framework.installName.startswith("@executable_path") or framework.installName.startswith(bundlePath):
-            if verbose >= 2:
-                print framework.frameworkName, "already deployed, skipping."
+            print(framework.frameworkName, "already deployed, skipping.")
             continue
-        
+
         # install_name_tool the new id into the binary
         changeInstallName(framework.installName, framework.deployedInstallName, binaryPath, verbose)
-        
-        # Copy farmework to app bundle.
+
+        # Copy framework to app bundle.
         deployedBinaryPath = copyFramework(framework, bundlePath, verbose)
         # Skip the rest if already was deployed.
         if deployedBinaryPath is None:
             continue
-        
+
         if strip:
             runStrip(deployedBinaryPath, verbose)
-        
+
         # install_name_tool it a new id.
         changeIdentification(framework.deployedInstallName, deployedBinaryPath, verbose)
-        # Check for framework dependencies
-        dependencies = getFrameworks(deployedBinaryPath, verbose)
-        
+        # Check for framework dependencies.
+        # Scan the ORIGINAL binary so that @loader_path / @rpath tokens
+        # resolve relative to the Qt prefix (where sibling frameworks
+        # exist) rather than the bundle (where they may not yet be copied).
+        originalPath = framework.sourceFilePath
+        if originalPath.startswith("Qt"):
+            originalPath = f"/Library/Frameworks/{originalPath}"
+        dependencies = getFrameworks(originalPath, verbose)
+
         for dependency in dependencies:
             changeInstallName(dependency.installName, dependency.deployedInstallName, deployedBinaryPath, verbose)
-            
+
             # Deploy framework if necessary.
             if dependency.frameworkName not in deploymentInfo.deployedFrameworks and dependency not in frameworks:
                 frameworks.append(dependency)
-    
+
     return deploymentInfo
 
-def deployFrameworksForAppBundle(applicationBundle, strip, verbose):
+def helperBinaries(applicationBundle: ApplicationBundleInfo) -> List[str]:
+    """Executables shipped in Contents/Helpers, in a stable order.
+
+    Contents/MacOS is for the bundle's MAIN executable. Auxiliary executables belong
+    in Contents/Helpers: codesign treats a stray Mach-O in Contents/MacOS as a
+    subcomponent that must be independently valid, and an unsigned one there makes the
+    whole bundle fail verification with "code object is not signed at all".
+    """
+    helpersDir = os.path.join(applicationBundle.path, "Contents", "Helpers")
+    if not os.path.isdir(helpersDir):
+        return []
+    out = []
+    for name in sorted(os.listdir(helpersDir)):
+        path = os.path.join(helpersDir, name)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            out.append(path)
+    return out
+
+
+def deployFrameworksForHelpers(applicationBundle: ApplicationBundleInfo, deploymentInfo: DeploymentInfo, strip: bool, verbose: int):
+    """Relocate library references for the helper executables, if any.
+
+    Pinkcoin's bundle ships none today (pink2d is released separately, as 2.4.0.0
+    did); this is kept from Gridcoin, which ships its daemon here. Without this pass
+    a helper keeps whatever absolute install names it linked against -- typically
+    Homebrew paths under /usr/local or /opt/homebrew. It would run on the build
+    machine and on any developer box with the same brew packages, and fail on a clean
+    install with a dyld error naming a library the user has never heard of.
+
+    Contents/Helpers is a sibling of Contents/Frameworks, exactly as Contents/MacOS is,
+    so the @executable_path/../Frameworks/... install names deployFrameworks() writes
+    resolve from a helper unchanged.
+
+    deployFrameworks() is safe to call again here: it rewrites the passed binary's
+    install names first, and copyFramework() returns None for anything already in the
+    bundle, so shared libraries are relocated rather than duplicated. Libraries a helper
+    needs and the GUI does not are copied in on this pass.
+    """
+    for binaryPath in helperBinaries(applicationBundle):
+        print(f"+ Deploying frameworks for {os.path.basename(binaryPath)} +")
+        frameworks = getFrameworks(binaryPath, verbose)
+        if not frameworks:
+            continue
+        deployFrameworks(frameworks, applicationBundle.path, binaryPath, strip, verbose, deploymentInfo)
+
+
+def deployFrameworksForAppBundle(applicationBundle: ApplicationBundleInfo, strip: bool, verbose: int) -> DeploymentInfo:
     frameworks = getFrameworks(applicationBundle.binaryPath, verbose)
-    if len(frameworks) == 0 and verbose >= 1:
-        print "Warning: Could not find any external frameworks to deploy in %s." % (applicationBundle.path)
+    if len(frameworks) == 0:
+        print(f"Warning: Could not find any external frameworks to deploy in {applicationBundle.path}.")
         return DeploymentInfo()
     else:
         return deployFrameworks(frameworks, applicationBundle.path, applicationBundle.binaryPath, strip, verbose)
 
-def deployPlugins(appBundleInfo, deploymentInfo, strip, verbose):
-    # Lookup available plugins, exclude unneeded
+# The Qt plugins Pinkcoin-Qt loads, by plugin directory. Besides the platform and
+# style, the GUI draws SVG icons through QIcon (iconengines/libqsvgicon; without
+# it QIcon falls back to loading each SVG as a pixmap at the file's own size,
+# through imageformats/libqsvg) and animates the sync spinner from a GIF through
+# QMovie (imageformats/libqgif; without it the spinner is blank). Its other
+# images are PNG, which Qt reads without a plugin.
+PLUGINS = {
+    'platforms': ['libqcocoa', 'libqminimal'],
+    'styles': ['libqmacstyle'],
+    'imageformats': ['libqsvg', 'libqgif'],
+    'iconengines': ['libqsvgicon'],
+}
+
+def deployPlugins(appBundleInfo: ApplicationBundleInfo, deploymentInfo: DeploymentInfo, strip: bool, verbose: int):
     plugins = []
     if deploymentInfo.pluginPath is None:
         return
     for dirpath, dirnames, filenames in os.walk(deploymentInfo.pluginPath):
         pluginDirectory = os.path.relpath(dirpath, deploymentInfo.pluginPath)
-        if pluginDirectory == "designer":
-            # Skip designer plugins
+
+        if pluginDirectory not in PLUGINS:
             continue
-        elif pluginDirectory == "phonon" or pluginDirectory == "phonon_backend":
-            # Deploy the phonon plugins only if phonon is in use
-            if not deploymentInfo.usesFramework("phonon"):
-                continue
-        elif pluginDirectory == "sqldrivers":
-            # Deploy the sql plugins only if QtSql is in use
-            if not deploymentInfo.usesFramework("QtSql"):
-                continue
-        elif pluginDirectory == "script":
-            # Deploy the script plugins only if QtScript is in use
-            if not deploymentInfo.usesFramework("QtScript"):
-                continue
-        elif pluginDirectory == "qmltooling" or pluginDirectory == "qml1tooling":
-            # Deploy the qml plugins only if QtDeclarative is in use
-            if not deploymentInfo.usesFramework("QtDeclarative"):
-                continue
-        elif pluginDirectory == "bearer":
-            # Deploy the bearer plugins only if QtNetwork is in use
-            if not deploymentInfo.usesFramework("QtNetwork"):
-                continue
-        elif pluginDirectory == "position":
-            # Deploy the position plugins only if QtPositioning is in use
-            if not deploymentInfo.usesFramework("QtPositioning"):
-                continue
-        elif pluginDirectory == "sensors" or pluginDirectory == "sensorgestures":
-            # Deploy the sensor plugins only if QtSensors is in use
-            if not deploymentInfo.usesFramework("QtSensors"):
-                continue
-        elif pluginDirectory == "audio" or pluginDirectory == "playlistformats":
-            # Deploy the audio plugins only if QtMultimedia is in use
-            if not deploymentInfo.usesFramework("QtMultimedia"):
-                continue
-        elif pluginDirectory == "mediaservice":
-            # Deploy the mediaservice plugins only if QtMultimediaWidgets is in use
-            if not deploymentInfo.usesFramework("QtMultimediaWidgets"):
-                continue
 
         for pluginName in filenames:
-            pluginPath = os.path.join(pluginDirectory, pluginName)
-            if pluginName.endswith("_debug.dylib"):
-                # Skip debug plugins
+            if pluginName.split('.')[0] not in PLUGINS[pluginDirectory]:
                 continue
-            elif pluginPath == "imageformats/libqsvg.dylib" or pluginPath == "iconengines/libqsvgicon.dylib":
-                # Deploy the svg plugins only if QtSvg is in use
-                if not deploymentInfo.usesFramework("QtSvg"):
-                    continue
-            elif pluginPath == "accessible/libqtaccessiblecompatwidgets.dylib":
-                # Deploy accessibility for Qt3Support only if the Qt3Support is in use
-                if not deploymentInfo.usesFramework("Qt3Support"):
-                    continue
-            elif pluginPath == "graphicssystems/libqglgraphicssystem.dylib":
-                # Deploy the opengl graphicssystem plugin only if QtOpenGL is in use
-                if not deploymentInfo.usesFramework("QtOpenGL"):
-                    continue
-            elif pluginPath == "accessible/libqtaccessiblequick.dylib":
-                # Deploy the accessible qtquick plugin only if QtQuick is in use
-                if not deploymentInfo.usesFramework("QtQuick"):
-                    continue
 
             plugins.append((pluginDirectory, pluginName))
-    
+
+    found = {(d, n.split('.')[0]) for d, n in plugins}
+    for pluginDirectory, names in PLUGINS.items():
+        for name in names:
+            if (pluginDirectory, name) not in found:
+                sys.stderr.write(f"Warning: Qt plugin {pluginDirectory}/{name} not found in {deploymentInfo.pluginPath}\n")
+
     for pluginDirectory, pluginName in plugins:
-        if verbose >= 2:
-            print "Processing plugin", os.path.join(pluginDirectory, pluginName), "..."
-        
+        print("Processing plugin", os.path.join(pluginDirectory, pluginName), "...")
+
         sourcePath = os.path.join(deploymentInfo.pluginPath, pluginDirectory, pluginName)
         destinationDirectory = os.path.join(appBundleInfo.pluginPath, pluginDirectory)
         if not os.path.exists(destinationDirectory):
             os.makedirs(destinationDirectory)
-        
+
         destinationPath = os.path.join(destinationDirectory, pluginName)
         shutil.copy2(sourcePath, destinationPath)
-        if verbose >= 3:
-            print "Copied:", sourcePath
-            print " to:", destinationPath
-        
+        if verbose:
+            print("Copied:", sourcePath)
+            print(" to:", destinationPath)
+
         if strip:
             runStrip(destinationPath, verbose)
-        
+
+        # A plugin keeps the install name it was built with, e.g.
+        # /usr/local/opt/qt@5/plugins/platforms/libqcocoa.dylib. dyld does not use
+        # it to load a plugin, but it is a build-machine path left in the bundle,
+        # which check-macos-bundle.sh rejects, so give it a bundle-relative one.
+        changeIdentification(f"@executable_path/../PlugIns/{pluginDirectory}/{pluginName}", destinationPath, verbose)
+
         dependencies = getFrameworks(destinationPath, verbose)
-        
+
         for dependency in dependencies:
             changeInstallName(dependency.installName, dependency.deployedInstallName, destinationPath, verbose)
-            
+
             # Deploy framework if necessary.
             if dependency.frameworkName not in deploymentInfo.deployedFrameworks:
                 deployFrameworks([dependency], appBundleInfo.path, destinationPath, strip, verbose, deploymentInfo)
-
-qt_conf="""[Paths]
-Translations=Resources
-Plugins=PlugIns
-"""
 
 ap = ArgumentParser(description="""Improved version of macdeployqt.
 
 Outputs a ready-to-deploy app in a folder "dist" and optionally wraps it in a .dmg file.
 Note, that the "dist" folder will be deleted before deploying on each run.
 
-Optionally, Qt translation files (.qm) and additional resources can be added to the bundle.
-
-Also optionally signs the .app bundle; set the CODESIGNARGS environment variable to pass arguments
-to the codesign tool.
-E.g. CODESIGNARGS='--sign "Developer ID Application: ..." --keychain /encrypted/foo.keychain'""")
+Optionally, Qt translation files (.qm) can be added to the bundle.""")
 
 ap.add_argument("app_bundle", nargs=1, metavar="app-bundle", help="application bundle to be deployed")
-ap.add_argument("-verbose", type=int, nargs=1, default=[1], metavar="<0-3>", help="0 = no output, 1 = error/warning (default), 2 = normal, 3 = debug")
+ap.add_argument("appname", nargs=1, metavar="appname", help="name of the app being deployed")
+ap.add_argument("-verbose", nargs="?", const=True, help="Output additional debugging information")
 ap.add_argument("-no-plugins", dest="plugins", action="store_false", default=True, help="skip plugin deployment")
 ap.add_argument("-no-strip", dest="strip", action="store_false", default=True, help="don't run 'strip' on the binaries")
-ap.add_argument("-sign", dest="sign", action="store_true", default=False, help="sign .app bundle with codesign tool")
-ap.add_argument("-dmg", nargs="?", const="", metavar="basename", help="create a .dmg disk image; if basename is not specified, a camel-cased version of the app name is used")
-ap.add_argument("-fancy", nargs=1, metavar="plist", default=[], help="make a fancy looking disk image using the given plist file with instructions; requires -dmg to work")
-ap.add_argument("-add-qt-tr", nargs=1, metavar="languages", default=[], help="add Qt translation files to the bundle's ressources; the language list must be separated with commas, not with whitespace")
-ap.add_argument("-translations-dir", nargs=1, metavar="path", default=None, help="Path to Qt's translation files")
-ap.add_argument("-add-resources", nargs="+", metavar="path", default=[], help="list of additional files or folders to be copied into the bundle's resources; must be the last argument")
+ap.add_argument("-dmg", nargs="?", const="", metavar="basename", help="create a .dmg disk image")
+ap.add_argument("-plugin-dir", nargs=1, metavar="path", default=None, help="Path to Qt's plugins directory (e.g. from qtpaths --query QT_INSTALL_PLUGINS)")
+ap.add_argument("-translations-dir", nargs=1, metavar="path", default=None, help="Path to Qt's translations. Base translations will automatically be added to the bundle's resources.")
+ap.add_argument("-sign", nargs="?", const="-", default=None, metavar="identity",
+    help="Code signing identity. Omit flag to skip signing. "
+         "Use without value for ad-hoc ('-').")
+ap.add_argument("-entitlements", nargs=1, default=None, metavar="path",
+    help="Path to entitlements plist for hardened runtime signing")
 
 config = ap.parse_args()
 
-verbose = config.verbose[0]
+# The signing identity may come from the APPLE_SIGNING_IDENTITY environment
+# variable instead of the -sign flag, because the identity string often
+# contains parentheses that break shell command-line expansion in CMake.
+# Priority: -sign <value> > APPLE_SIGNING_IDENTITY env var > ad-hoc on macOS.
+env_identity = os.getenv("APPLE_SIGNING_IDENTITY")
+if config.sign is None and env_identity:
+    config.sign = env_identity
+elif config.sign is None and platform.system() == "Darwin":
+    config.sign = "-"
+
+verbose = config.verbose
 
 # ------------------------------------------------
 
 app_bundle = config.app_bundle[0]
+appname = config.appname[0]
 
 if not os.path.exists(app_bundle):
-    if verbose >= 1:
-        sys.stderr.write("Error: Could not find app bundle \"%s\"\n" % (app_bundle))
+    sys.stderr.write(f"Error: Could not find app bundle \"{app_bundle}\"\n")
     sys.exit(1)
 
-app_bundle_name = os.path.splitext(os.path.basename(app_bundle))[0]
-
-# ------------------------------------------------
-translations_dir = None
-if config.translations_dir and config.translations_dir[0]:
-    if os.path.exists(config.translations_dir[0]):
-        translations_dir = config.translations_dir[0]
-    else:
-        if verbose >= 1:
-            sys.stderr.write("Error: Could not find translation dir \"%s\"\n" % (translations_dir))
-        sys.exit(1)
 # ------------------------------------------------
 
-for p in config.add_resources:
-    if verbose >= 3:
-        print "Checking for \"%s\"..." % p
-    if not os.path.exists(p):
-        if verbose >= 1:
-            sys.stderr.write("Error: Could not find additional resource file \"%s\"\n" % (p))
-        sys.exit(1)
-
-# ------------------------------------------------
-
-if len(config.fancy) == 1:
-    if verbose >= 3:
-        print "Fancy: Importing plistlib..."
-    try:
-        import plistlib
-    except ImportError:
-        if verbose >= 1:
-            sys.stderr.write("Error: Could not import plistlib which is required for fancy disk images.\n")
-        sys.exit(1)
-    
-    p = config.fancy[0]
-    if verbose >= 3:
-        print "Fancy: Loading \"%s\"..." % p
-    if not os.path.exists(p):
-        if verbose >= 1:
-            sys.stderr.write("Error: Could not find fancy disk image plist at \"%s\"\n" % (p))
-        sys.exit(1)
-    
-    try:
-        fancy = plistlib.readPlist(p)
-    except:
-        if verbose >= 1:
-            sys.stderr.write("Error: Could not parse fancy disk image plist at \"%s\"\n" % (p))
-        sys.exit(1)
-    
-    try:
-        assert not fancy.has_key("window_bounds") or (isinstance(fancy["window_bounds"], list) and len(fancy["window_bounds"]) == 4)
-        assert not fancy.has_key("background_picture") or isinstance(fancy["background_picture"], str)
-        assert not fancy.has_key("icon_size") or isinstance(fancy["icon_size"], int)
-        assert not fancy.has_key("applications_symlink") or isinstance(fancy["applications_symlink"], bool)
-        if fancy.has_key("items_position"):
-            assert isinstance(fancy["items_position"], dict)
-            for key, value in fancy["items_position"].iteritems():
-                assert isinstance(value, list) and len(value) == 2 and isinstance(value[0], int) and isinstance(value[1], int)
-    except:
-        if verbose >= 1:
-            sys.stderr.write("Error: Bad format of fancy disk image plist at \"%s\"\n" % (p))
-        sys.exit(1)
-    
-    if fancy.has_key("background_picture"):
-        bp = fancy["background_picture"]
-        if verbose >= 3:
-            print "Fancy: Resolving background picture \"%s\"..." % bp
-        if not os.path.exists(bp):
-            bp = os.path.join(os.path.dirname(p), bp)
-            if not os.path.exists(bp):
-                if verbose >= 1:
-                    sys.stderr.write("Error: Could not find background picture at \"%s\" or \"%s\"\n" % (fancy["background_picture"], bp))
-                sys.exit(1)
-            else:
-                fancy["background_picture"] = bp
-else:
-    fancy = None
-
-# ------------------------------------------------
+# When -dmg is given with an explicit basename, use it for the output file;
+# otherwise fall back to appname.  The volume name always uses appname so that
+# the mounted disk appears as e.g. "Pinkcoin-Qt" regardless of the .dmg filename.
+dmg_basename = config.dmg if (config.dmg is not None and config.dmg != "") else appname
 
 if os.path.exists("dist"):
-    if verbose >= 2:
-        print "+ Removing old dist folder +"
-    
+    print("+ Removing existing dist folder +")
     shutil.rmtree("dist")
+
+if os.path.exists(dmg_basename + ".dmg"):
+    print("+ Removing existing DMG +")
+    os.unlink(dmg_basename + ".dmg")
+
+if os.path.exists(dmg_basename + ".temp.dmg"):
+    os.unlink(dmg_basename + ".temp.dmg")
 
 # ------------------------------------------------
 
-target = os.path.join("dist", app_bundle)
+target = os.path.join("dist", BUNDLE_NAME)
 
-if verbose >= 2:
-    print "+ Copying source bundle +"
-if verbose >= 3:
-    print app_bundle, "->", target
+print("+ Copying source bundle +")
+if verbose:
+    print(app_bundle, "->", target)
 
 os.mkdir("dist")
 shutil.copytree(app_bundle, target, symlinks=True)
@@ -610,273 +734,299 @@ applicationBundle = ApplicationBundleInfo(target)
 
 # ------------------------------------------------
 
-if verbose >= 2:
-    print "+ Deploying frameworks +"
+print("+ Deploying frameworks +")
 
 try:
     deploymentInfo = deployFrameworksForAppBundle(applicationBundle, config.strip, verbose)
+    deployFrameworksForHelpers(applicationBundle, deploymentInfo, config.strip, verbose)
     if deploymentInfo.qtPath is None:
         deploymentInfo.qtPath = os.getenv("QTDIR", None)
         if deploymentInfo.qtPath is None:
-            if verbose >= 1:
-                sys.stderr.write("Warning: Could not detect Qt's path, skipping plugin deployment!\n")
+            sys.stderr.write("Warning: Could not detect Qt's path, skipping plugin deployment!\n")
             config.plugins = False
 except RuntimeError as e:
-    if verbose >= 1:
-        sys.stderr.write("Error: %s\n" % str(e))
+    sys.stderr.write(f"Error: {str(e)}\n")
     sys.exit(1)
+
+# Override plugin path if explicitly provided via -plugin-dir
+if config.plugin_dir is not None:
+    explicit_plugin_dir = config.plugin_dir[0]
+    if os.path.isdir(explicit_plugin_dir):
+        deploymentInfo.pluginPath = explicit_plugin_dir
+    else:
+        sys.stderr.write(f"Warning: -plugin-dir path does not exist: {explicit_plugin_dir}\n")
 
 # ------------------------------------------------
 
 if config.plugins:
-    if verbose >= 2:
-        print "+ Deploying plugins +"
-    
-    try:
-        deployPlugins(applicationBundle, deploymentInfo, config.strip, verbose)
-    except RuntimeError as e:
-        if verbose >= 1:
-            sys.stderr.write("Error: %s\n" % str(e))
+    print("+ Deploying plugins +")
+
+    if deploymentInfo.pluginPath is None:
+        sys.stderr.write("Warning: Qt plugin path not found, skipping plugin deployment!\n")
+    else:
+        try:
+            deployPlugins(applicationBundle, deploymentInfo, config.strip, verbose)
+        except RuntimeError as e:
+            sys.stderr.write(f"Error: {str(e)}\n")
+            sys.exit(1)
+
+# ------------------------------------------------
+
+if config.translations_dir:
+    if not Path(config.translations_dir[0]).exists():
+        sys.stderr.write(f"Error: Could not find translation dir \"{config.translations_dir[0]}\"\n")
         sys.exit(1)
 
+    print("+ Adding Qt translations +")
+
+    translations = Path(config.translations_dir[0])
+
+    regex = re.compile('qt_[a-z]*(.qm|_[A-Z]*.qm)')
+
+    lang_files = [x for x in translations.iterdir() if regex.match(x.name)]
+
+    # In Qt 5, qt_<lang>.qm is (for most languages) a meta catalog: it holds no
+    # messages, only the names of the module catalogs it loads (qtbase_<lang>,
+    # qtscript_<lang>, qtmultimedia_<lang>, qtxmlpatterns_<lang>).
+    # QTranslator::load() fails if any of them is missing, so copying
+    # qt_<lang>.qm alone ships a translation that never loads. Copy each catalog
+    # together with what it names, and skip one whose dependencies are not all
+    # there.
+    copied = set()
+    for file in lang_files:
+        closure, missing = qmClosure(translations, file.name)
+        if missing:
+            print(f"  skipping {file.name}: {', '.join(missing)} not in {translations}")
+            continue
+        for name in closure:
+            if name in copied:
+                continue
+            copied.add(name)
+            source = translations / name
+            if verbose:
+                print(source.as_posix(), "->", os.path.join(applicationBundle.resourcesPath, name))
+            shutil.copy2(source.as_posix(), os.path.join(applicationBundle.resourcesPath, name))
+    print(f"  {len(copied)} catalogs for {len(lang_files)} languages")
+
 # ------------------------------------------------
 
-if len(config.add_qt_tr) == 0:
-    add_qt_tr = []
+print("+ Installing qt.conf +")
+
+qt_conf="""[Paths]
+Translations=Resources
+Plugins=PlugIns
+"""
+
+with open(os.path.join(applicationBundle.resourcesPath, "qt.conf"), "wb") as f:
+    f.write(qt_conf.encode())
+
+# ------------------------------------------------
+
+if HAS_DS_STORE:
+    print("+ Generating .DS_Store +")
+
+    output_file = os.path.join("dist", ".DS_Store")
+
+    ds = DSStore.open(output_file, 'w+')
+
+    ds['.']['bwsp'] = {
+        'WindowBounds': '{{300, 280}, {500, 343}}',
+        'PreviewPaneVisibility': False,
+    }
+
+    icvp = {
+        'gridOffsetX': 0.0,
+        'textSize': 12.0,
+        'viewOptionsVersion': 1,
+        'backgroundImageAlias': b'\x00\x00\x00\x00\x02\x1e\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xd1\x94\\\xb0H+\x00\x05\x00\x00\x00\x98\x0fbackground.tiff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x99\xd19\xb0\xf8\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\x00\x00\r\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0b.background\x00\x00\x10\x00\x08\x00\x00\xd1\x94\\\xb0\x00\x00\x00\x11\x00\x08\x00\x00\xd19\xb0\xf8\x00\x00\x00\x01\x00\x04\x00\x00\x00\x98\x00\x0e\x00 \x00\x0f\x00b\x00a\x00c\x00k\x00g\x00r\x00o\x00u\x00n\x00d\x00.\x00t\x00i\x00f\x00f\x00\x0f\x00\x02\x00\x00\x00\x12\x00\x1c/.background/background.tiff\x00\x14\x01\x06\x00\x00\x00\x00\x01\x06\x00\x02\x00\x00\x0cMacintosh HD\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xce\x97\xab\xc3H+\x00\x00\x01\x88[\x88\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02u\xab\x8d\xd1\x94\\\xb0devrddsk\xff\xff\xff\xff\x00\x00\t \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x07bitcoin\x00\x00\x10\x00\x08\x00\x00\xce\x97\xab\xc3\x00\x00\x00\x11\x00\x08\x00\x00\xd1\x94\\\xb0\x00\x00\x00\x01\x00\x14\x01\x88[\x88\x00\x16\xa9\t\x00\x08\xfaR\x00\x08\xfaQ\x00\x02d\x8e\x00\x0e\x00\x02\x00\x00\x00\x0f\x00\x1a\x00\x0c\x00M\x00a\x00c\x00i\x00n\x00t\x00o\x00s\x00h\x00 \x00H\x00D\x00\x13\x00\x01/\x00\x00\x15\x00\x02\x00\x14\xff\xff\x00\x00\xff\xff\x00\x00',
+        'backgroundColorBlue': 1.0,
+        'iconSize': 96.0,
+        'backgroundColorGreen': 1.0,
+        'arrangeBy': 'none',
+        'showIconPreview': True,
+        'gridSpacing': 100.0,
+        'gridOffsetY': 0.0,
+        'showItemInfo': False,
+        'labelOnBottom': True,
+        'backgroundType': 2,
+        'backgroundColorRed': 1.0
+    }
+    alias = Alias().from_bytes(icvp['backgroundImageAlias'])
+    alias.volume.name = appname
+    alias.volume.posix_path = '/Volumes/' + appname
+    icvp['backgroundImageAlias'] = alias.to_bytes()
+    ds['.']['icvp'] = icvp
+
+    ds['.']['vSrn'] = ('long', 1)
+
+    ds['Applications']['Iloc'] = (370, 156)
+    ds[BUNDLE_NAME]['Iloc'] = (128, 156)
+
+    ds.flush()
+    ds.close()
 else:
-    if translations_dir is not None:
-        qt_tr_dir = translations_dir
-    else:
-        if deploymentInfo.qtPath is not None:
-            qt_tr_dir = os.path.join(deploymentInfo.qtPath, "translations")
-        else:
-            sys.stderr.write("Error: Could not find Qt translation path\n")
-            sys.exit(1)
-    add_qt_tr = ["qt_%s.qm" % lng for lng in config.add_qt_tr[0].split(",")]
-    for lng_file in add_qt_tr:
-        p = os.path.join(qt_tr_dir, lng_file)
-        if verbose >= 3:
-            print "Checking for \"%s\"..." % p
-        if not os.path.exists(p):
-            if verbose >= 1:
-                sys.stderr.write("Error: Could not find Qt translation file \"%s\"\n" % (lng_file))
-                sys.exit(1)
+    print("+ Skipping .DS_Store generation (ds_store/mac_alias packages not installed) +")
 
 # ------------------------------------------------
 
-if verbose >= 2:
-    print "+ Installing qt.conf +"
+if config.sign is not None and platform.system() == "Darwin":
+    identity = config.sign
+    entitlements_path = config.entitlements[0] if config.entitlements else None
+    # Use hardened runtime only for real identities (not ad-hoc).
+    hardened = (identity != "-") and (entitlements_path is not None)
 
-f = open(os.path.join(applicationBundle.resourcesPath, "qt.conf"), "wb")
-f.write(qt_conf)
-f.close()
+    print("+ Code signing (inside-out) +")
+    print(f"  Identity: {identity}")
+    print(f"  Hardened runtime: {hardened}")
+    if entitlements_path:
+        print(f"  Entitlements: {entitlements_path}")
 
-# ------------------------------------------------
+    # 1. Sign all dylibs and frameworks in Contents/Frameworks/
+    frameworks_dir = os.path.join(target, "Contents", "Frameworks")
+    if os.path.exists(frameworks_dir):
+        for item in sorted(os.listdir(frameworks_dir)):
+            item_path = os.path.join(frameworks_dir, item)
+            if item.endswith(".dylib"):
+                codesignItem(item_path, identity, None, hardened, verbose)
+            elif item.endswith(".framework"):
+                codesignItem(item_path, identity, None, hardened, verbose)
 
-if len(add_qt_tr) > 0 and verbose >= 2:
-    print "+ Adding Qt translations +"
+    # 2. Sign all plugins in Contents/PlugIns/
+    plugins_dir = os.path.join(target, "Contents", "PlugIns")
+    if os.path.exists(plugins_dir):
+        for dirpath, dirnames, filenames in os.walk(plugins_dir):
+            for filename in sorted(filenames):
+                if filename.endswith(".dylib"):
+                    codesignItem(os.path.join(dirpath, filename),
+                                 identity, None, hardened, verbose)
 
-for lng_file in add_qt_tr:
-    if verbose >= 3:
-        print os.path.join(qt_tr_dir, lng_file), "->", os.path.join(applicationBundle.resourcesPath, lng_file)
-    shutil.copy2(os.path.join(qt_tr_dir, lng_file), os.path.join(applicationBundle.resourcesPath, lng_file))
+    # 3. Sign helper executables in Contents/Helpers, BEFORE the main binary and the
+    #    bundle. Inside-out order is not a style choice here: codesign validates a
+    #    bundle's subcomponents, so an unsigned helper makes signing the bundle fail
+    #    with "code object is not signed at all" naming the helper as the subcomponent.
+    #    Helpers get the same entitlements as the main binary.
+    helpers_dir = os.path.join(target, "Contents", "Helpers")
+    if os.path.exists(helpers_dir):
+        for item in sorted(os.listdir(helpers_dir)):
+            item_path = os.path.join(helpers_dir, item)
+            if os.path.isfile(item_path) and os.access(item_path, os.X_OK):
+                codesignItem(item_path, identity, entitlements_path, hardened, verbose)
 
-# ------------------------------------------------
+    # 4. Sign the main executable (with entitlements)
+    main_binary = os.path.join(target, "Contents", "MacOS", BUNDLE_EXECUTABLE)
+    codesignItem(main_binary, identity, entitlements_path, hardened, verbose)
 
-if len(config.add_resources) > 0 and verbose >= 2:
-    print "+ Adding additional resources +"
+    # 5. Sign the top-level app bundle (with entitlements)
+    codesignItem(target, identity, entitlements_path, hardened, verbose)
 
-for p in config.add_resources:
-    t = os.path.join(applicationBundle.resourcesPath, os.path.basename(p))
-    if verbose >= 3:
-        print p, "->", t
-    if os.path.isdir(p):
-        shutil.copytree(p, t, symlinks=True)
-    else:
-        shutil.copy2(p, t)
-
-# ------------------------------------------------
-
-if config.sign and 'CODESIGNARGS' not in os.environ:
-    print "You must set the CODESIGNARGS environment variable. Skipping signing."
-elif config.sign:
-    if verbose >= 1:
-        print "Code-signing app bundle %s"%(target,)
-    subprocess.check_call("codesign --deep --force %s %s"%(os.environ['CODESIGNARGS'], target), shell=True)
-
-# ------------------------------------------------
+    # 6. Verify
+    print("+ Verifying code signature +")
+    subprocess.check_call(["codesign", "--verify", "--strict", "--verbose=2", target])
 
 if config.dmg is not None:
 
-    #Patch in check_output for Python 2.6
-    if "check_output" not in dir( subprocess ):
-        def f(*popenargs, **kwargs):
-            if 'stdout' in kwargs:
-                raise ValueError('stdout argument not allowed, it will be overridden.')
-            process = subprocess.Popen(stdout=subprocess.PIPE, *popenargs, **kwargs)
-            output, unused_err = process.communicate()
-            retcode = process.poll()
-            if retcode:
-                cmd = kwargs.get("args")
-                if cmd is None:
-                    cmd = popenargs[0]
-                raise CalledProcessError(retcode, cmd)
-            return output
-        subprocess.check_output = f
+    print("+ Preparing .dmg disk image +")
 
-    def runHDIUtil(verb, image_basename, **kwargs):
-        hdiutil_args = ["hdiutil", verb, image_basename + ".dmg"]
-        if kwargs.has_key("capture_stdout"):
-            del kwargs["capture_stdout"]
-            run = subprocess.check_output
-        else:
-            if verbose < 2:
-                hdiutil_args.append("-quiet")
-            elif verbose >= 3:
-                hdiutil_args.append("-verbose")
-            run = subprocess.check_call
-        
-        for key, value in kwargs.iteritems():
-            hdiutil_args.append("-" + key)
-            if not value is True:
-                hdiutil_args.append(str(value))
-        
-        return run(hdiutil_args)
-    
-    if verbose >= 2:
-        if fancy is None:
-            print "+ Creating .dmg disk image +"
-        else:
-            print "+ Preparing .dmg disk image +"
-    
-    if config.dmg != "":
-        dmg_name = config.dmg
+    if verbose:
+        print("Determining size of \"dist\"...")
+    size = 0
+    for path, dirs, files in os.walk("dist"):
+        for file in files:
+            size += os.path.getsize(os.path.join(path, file))
+    size += int(size * 0.15)
+
+    if verbose:
+        print("Creating temp image for modification...")
+
+    tempname: str = dmg_basename + ".temp.dmg"
+
+    def run_hdiutil_with_retry(args, attempts=4, delay=15, **kwargs):
+        # hdiutil races against Spotlight/fseventsd still indexing freshly
+        # written files on CI runners and fails transiently with "Resource
+        # busy" or "Resource temporarily unavailable"; a short pause and a
+        # retry clears it. The final attempt raises like check=True would.
+        # check must not sneak in through kwargs: it would raise on the
+        # first failure and silently bypass the retry this helper exists for.
+        kwargs.pop("check", None)
+        kwargs.setdefault("universal_newlines", True)
+        for attempt in range(1, attempts + 1):
+            result = run(["hdiutil"] + args, **kwargs)
+            if result.returncode == 0:
+                return result
+            if attempt < attempts:
+                print(f"hdiutil {args[0]} failed (attempt {attempt}/{attempts}), retrying in {delay}s...")
+                time.sleep(delay)
+        result.check_returncode()
+
+    # -ov: a failed attempt can leave a partial temp image behind; overwrite
+    # it so the retry does not die on "File exists".
+    run_hdiutil_with_retry(["create", tempname, "-ov", "-srcfolder", "dist", "-format", "UDRW", "-size", str(size), "-volname", appname])
+
+    if verbose:
+        print("Attaching temp image...")
+    output = run_hdiutil_with_retry(["attach", tempname, "-readwrite"], stdout=PIPE).stdout
+
+    m = re.search(r"/Volumes/(.+$)", output)
+    disk_root = m.group(0)
+    # The image's own device node is the first /dev/diskN line attach prints.
+    # An APFS image adds a synthesized container disk after it; ejecting the
+    # image's device takes the container and the volume with it.
+    d = re.search(r"^(/dev/disk\d+)\s", output, re.MULTILINE)
+    device = d.group(1)
+
+    print("+ Applying fancy settings +")
+
+    bg_file = 'background.tiff'
+    if os.path.exists(bg_file):
+        bg_path = os.path.join(disk_root, ".background", os.path.basename(bg_file))
+        os.mkdir(os.path.dirname(bg_path))
+        if verbose:
+            print(bg_file, "->", bg_path)
+        shutil.copy2(bg_file, bg_path)
     else:
-        spl = app_bundle_name.split(" ")
-        dmg_name = spl[0] + "".join(p.capitalize() for p in spl[1:])
-    
-    if fancy is None:
-        try:
-            runHDIUtil("create", dmg_name, srcfolder="dist", format="UDBZ", volname=app_bundle_name, ov=True)
-        except subprocess.CalledProcessError as e:
-            sys.exit(e.returncode)
-    else:
-        if verbose >= 3:
-            print "Determining size of \"dist\"..."
-        size = 0
-        for path, dirs, files in os.walk("dist"):
-            for file in files:
-                size += os.path.getsize(os.path.join(path, file))
-        size += int(size * 0.1)
-        
-        if verbose >= 3:
-            print "Creating temp image for modification..."
-        try:
-            runHDIUtil("create", dmg_name + ".temp", srcfolder="dist", format="UDRW", size=size, volname=app_bundle_name, ov=True)
-        except subprocess.CalledProcessError as e:
-            sys.exit(e.returncode)
-        
-        if verbose >= 3:
-            print "Attaching temp image..."
-        try:
-            output = runHDIUtil("attach", dmg_name + ".temp", readwrite=True, noverify=True, noautoopen=True, capture_stdout=True)
-        except subprocess.CalledProcessError as e:
-            sys.exit(e.returncode)
-        
-        m = re.search("/Volumes/(.+$)", output)
-        disk_root = m.group(0)
-        disk_name = m.group(1)
-        
-        if verbose >= 2:
-            print "+ Applying fancy settings +"
-        
-        if fancy.has_key("background_picture"):
-            bg_path = os.path.join(disk_root, os.path.basename(fancy["background_picture"]))
-            if verbose >= 3:
-                print fancy["background_picture"], "->", bg_path
-            shutil.copy2(fancy["background_picture"], bg_path)
-        else:
-            bg_path = None
-        
-        if fancy.get("applications_symlink", False):
-            os.symlink("/Applications", os.path.join(disk_root, "Applications"))
-        
-        # The Python appscript package broke with OSX 10.8 and isn't being fixed.
-        # So we now build up an AppleScript string and use the osascript command
-        # to make the .dmg file pretty:
-        appscript = Template( """
-        on run argv
-           tell application "Finder"
-             tell disk "$disk"
-                   open
-                   set current view of container window to icon view
-                   set toolbar visible of container window to false
-                   set statusbar visible of container window to false
-                   set the bounds of container window to {$window_bounds}
-                   set theViewOptions to the icon view options of container window
-                   set arrangement of theViewOptions to not arranged
-                   set icon size of theViewOptions to $icon_size
-                   $background_commands
-                   $items_positions
-                   close -- close/reopen works around a bug...
-                   open
-                   update without registering applications
-                   delay 5
-                   eject
-             end tell
-           end tell
-        end run
-        """)
+        print("  (Skipping background image: background.tiff not found)")
 
-        itemscript = Template('set position of item "${item}" of container window to {${position}}')
-        items_positions = []
-        if fancy.has_key("items_position"):
-            for name, position in fancy["items_position"].iteritems():
-                params = { "item" : name, "position" : ",".join([str(p) for p in position]) }
-                items_positions.append(itemscript.substitute(params))
+    os.symlink("/Applications", os.path.join(disk_root, "Applications"))
 
-        params = {
-            "disk" : "Pinkcoin-Qt",
-            "window_bounds" : "300,300,800,620",
-            "icon_size" : "96",
-            "background_commands" : "",
-            "items_positions" : "\n                   ".join(items_positions)
-            }
-        if fancy.has_key("window_bounds"):
-            params["window.bounds"] = ",".join([str(p) for p in fancy["window_bounds"]])
-        if fancy.has_key("icon_size"):
-            params["icon_size"] = str(fancy["icon_size"])
-        if bg_path is not None:
-            # Set background file, then call SetFile to make it invisible.
-            # (note: making it invisible first makes set background picture fail)
-            bgscript = Template("""set background picture of theViewOptions to file "$bgpic"
-                   do shell script "SetFile -a V /Volumes/$disk/$bgpic" """)
-            params["background_commands"] = bgscript.substitute({"bgpic" : os.path.basename(bg_path), "disk" : params["disk"]})
+    print("+ Finalizing .dmg disk image +")
 
-        s = appscript.substitute(params)
-        if verbose >= 2:
-            print("Running AppleScript:")
-            print(s)
+    # The DETACH is the operation that races the indexer, not the convert, and
+    # it was the one call here that neither retried nor checked its result.
+    # Spotlight and fseventsd index the volume we have just written and hold it
+    # open, so the eject fails with "Resource busy". Nothing looked at that, and
+    # the convert below then ran against a still-mounted image and failed with
+    # "Resource temporarily unavailable" -- four times, because retrying a
+    # convert cannot un-mount anything. Observed on a macos-15-intel runner:
+    # one failed eject followed by four identical convert failures, and a
+    # traceback that named convert as the culprit.
+    #
+    # Retry the eject instead, and fail loudly if it never takes.
+    #
+    # Detach the device node, not the mount path. A detach can unmount the
+    # volume and then fail to eject the device: 'couldn't eject "disk2" -
+    # Resource busy'. The mount path is gone at that point but the image is
+    # still attached, so every later detach of the path, -force included,
+    # fails with "No such file or directory" and the retry can never succeed.
+    # Observed on a macos-15-intel runner: one busy eject, then seven of
+    # those. The device node names the image until it is detached, mounted
+    # or not.
+    try:
+        run_hdiutil_with_retry(["detach", device])
+    except CalledProcessError:
+        # Last resort. -force ejects a volume something else still holds open.
+        # Everything that writes to the image is done by this point -- the
+        # fancy settings above are the last thing to touch it -- so there is
+        # nothing left to lose by forcing, and it beats failing a release
+        # because an indexer was still reading.
+        print("hdiutil detach still busy after retries; forcing the eject")
+        run_hdiutil_with_retry(["detach", "-force", device])
 
-        p = subprocess.Popen(['osascript', '-'], stdin=subprocess.PIPE)
-        p.communicate(input=s)
-        if p.returncode:
-            print("Error running osascript.")
+    run_hdiutil_with_retry(["convert", tempname, "-format", "UDZO", "-o", dmg_basename, "-imagekey", "zlib-level=9"])
 
-        if verbose >= 2:
-            print "+ Finalizing .dmg disk image +"
-            time.sleep(5)
-        
-        try:
-            runHDIUtil("convert", dmg_name + ".temp", format="UDBZ", o=dmg_name + ".dmg", ov=True)
-        except subprocess.CalledProcessError as e:
-            sys.exit(e.returncode)
-        
-        os.unlink(dmg_name + ".temp.dmg")
+    os.unlink(tempname)
 
 # ------------------------------------------------
 
-if verbose >= 2:
-    print "+ Done +"
+print("+ Done +")
 
 sys.exit(0)
