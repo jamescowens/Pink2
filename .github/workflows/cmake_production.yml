@@ -128,17 +128,25 @@ jobs:
             sudo apt-get install -y wine-stable wine64 wine32
           fi
 
+      # The compilers also name the depends cache (below): their first
+      # --version lines, made safe for a cache key.
       - name: Toolchain versions
+        id: toolchain
         run: |
           cmake --version | sed -n 1p
           gcc --version | sed -n 1p
           ldd --version | sed -n 1p
+          compilers="$(gcc --version | sed -n 1p)"
           if [[ "${{ matrix.host }}" == *"mingw"* ]]; then
             x86_64-w64-mingw32-g++ --version | sed -n 1p
             # Fails unless the alternative above took.
             x86_64-w64-mingw32-g++ -v 2>&1 | grep 'Thread model: posix'
+            compilers+=" $(x86_64-w64-mingw32-g++ --version | sed -n 1p)"
             wine --version
           fi
+          key=$(printf '%s' "$compilers" | tr -c 'A-Za-z0-9._-' '_' | tr -s '_')
+          echo "compilers: $key"
+          echo "compilers=$key" >> "$GITHUB_OUTPUT"
 
       # 2. Setup Concurrency
       - name: Setup Concurrency
@@ -160,7 +168,12 @@ jobs:
       # lands where those paths point.
       #
       # toolchain.cmake.in is in the key too: on a hit `make` does not run, and
-      # it is the file depends turns into the toolchain this build uses.
+      # it is the file depends turns into the toolchain this build uses. So are
+      # the compilers (steps.toolchain): on an exact hit, an image update to
+      # gcc or mingw-w64 would otherwise link this build against libraries the
+      # old compiler built. A partial restore across compilers is safe, as
+      # depends' own build ids hash each compiler's --version (depends/gen_id)
+      # and make rebuilds what they no longer match.
       #
       # Restore and save are separate steps so that the depends tree is saved as
       # soon as it is built, even if a later step fails; the Qt build is the
@@ -173,8 +186,9 @@ jobs:
           path: |
             depends/built
             depends/${{ matrix.host }}
-          key: ${{ matrix.os }}-depends-${{ matrix.host }}-${{ hashFiles('depends/packages/*', 'depends/patches/**', 'depends/Makefile', 'depends/funcs.mk', 'depends/hosts/*', 'depends/builders/*', 'depends/toolchain.cmake.in') }}
+          key: ${{ matrix.os }}-depends-${{ matrix.host }}-${{ steps.toolchain.outputs.compilers }}-${{ hashFiles('depends/packages/*', 'depends/patches/**', 'depends/Makefile', 'depends/funcs.mk', 'depends/hosts/*', 'depends/builders/*', 'depends/toolchain.cmake.in') }}
           restore-keys: |
+            ${{ matrix.os }}-depends-${{ matrix.host }}-${{ steps.toolchain.outputs.compilers }}-
             ${{ matrix.os }}-depends-${{ matrix.host }}-
 
       # 4. Build Depends
