@@ -193,8 +193,8 @@ if(CMAKE_CROSSCOMPILING)
     )
 endif()
 
-# The sub-build's own output goes to log files in the build tree (LOG_BUILD
-# below), so state here what it is given; CI logs then show it.
+# The sub-build's own output goes to log files in the build tree (below), so
+# state here what it is given; CI logs then show it.
 message(STATUS "Berkeley DB (bundled): CC=${BDB_CC}")
 message(STATUS "Berkeley DB (bundled): CXX=${BDB_CXX}")
 message(STATUS "Berkeley DB (bundled): CFLAGS=${BDB_C_FLAGS}")
@@ -209,9 +209,11 @@ message(STATUS "Berkeley DB (bundled): CXXFLAGS=${BDB_CXX_FLAGS}")
 # the outer make's job server: the -j of `cmake --build -j N` (or of
 # CMAKE_BUILD_PARALLEL_LEVEL, which cmake --build turns into -j) bounds BDB's
 # compiles and the rest of the tree's together, and a serial build builds BDB
-# serially. ExternalProject keeps the $(MAKE) on the recipe line when it wraps
-# the step for LOG_BUILD. The sub-make also inherits the outer make's -s, so
-# BDB's build log holds its warnings and errors but not its command lines.
+# serially. Its output goes to BerkeleyDB_Project-build.log in this directory
+# through build-aux/cmake/run-logged.sh, not through LOG_BUILD: LOG_BUILD's
+# `cmake -P` wrapper closes the job server's descriptors on macOS, where BDB
+# then built with one job. The sub-make also inherits the outer make's -s, so
+# the log holds BDB's warnings and errors but not its command lines.
 #
 # Other generators (Ninja) have no job server to share. There BDB's make takes
 # -j from CMAKE_BUILD_PARALLEL_LEVEL in the configure environment, and runs one
@@ -238,11 +240,11 @@ ExternalProject_Add(BerkeleyDB_Project
     BINARY_DIR ${LIBDB_BUILD_DIR}
     CONFIGURE_COMMAND ${SH_EXE} ${CMAKE_CURRENT_SOURCE_DIR}/dist/configure ${BDB_FLAGS}
         COMMAND ${MAKE_EXE} clean
-    BUILD_COMMAND ${BDB_MAKE} libdb_cxx.a
+    BUILD_COMMAND ${SH_EXE} "${CMAKE_SOURCE_DIR}/build-aux/cmake/run-logged.sh"
+        "${CMAKE_CURRENT_BINARY_DIR}/BerkeleyDB_Project-build.log" ${BDB_MAKE} libdb_cxx.a
     INSTALL_COMMAND ""
     BUILD_BYPRODUCTS ${libdb_cxx_library}
     LOG_CONFIGURE TRUE
-    LOG_BUILD TRUE
     LOG_OUTPUT_ON_FAILURE TRUE
 )
 
