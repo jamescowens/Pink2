@@ -611,23 +611,6 @@ jobs:
         timeout-minutes: 45
         run: ctest --test-dir build --output-on-failure --timeout 1800
 
-      - name: Dump crash reports on test failure
-        # macOS writes a symbolicated report to DiagnosticReports when a process
-        # aborts. Without this the only evidence of a crash is the terminate
-        # message on stderr, which names the exception type but not where it was
-        # thrown.
-        if: failure()
-        run: |
-          echo "=== DiagnosticReports ==="
-          ls -la ~/Library/Logs/DiagnosticReports/ 2>/dev/null || echo "  (none)"
-          for f in ~/Library/Logs/DiagnosticReports/*pink2* ~/Library/Logs/DiagnosticReports/*Pinkcoin*; do
-            [ -e "$f" ] || continue
-            echo "---------- $f"
-            # .ips reports are JSON with a leading metadata line; print raw either way.
-            head -c 20000 "$f"
-            echo
-          done
-
       - name: Package (DMG)
         run: cmake --build build --target deploy
 
@@ -690,9 +673,10 @@ jobs:
 
       # Testnet, networking off (-connect=0 -listen=0 -upnp=0 -staking=0),
       # throwaway data directory, on the programs as users get them: pink2d
-      # from the tarball, then the GUI from the mounted DMG, on Qt's minimal
-      # platform plugin, which the bundle carries (macdeployqtplus), so no
-      # window server is needed.
+      # from the tarball, then the GUI from the mounted DMG. On macOS the GUI
+      # needs the Cocoa platform plugin: MacDockIconHandler sets a Dock menu,
+      # which the minimal and offscreen plugins do not provide. Hosted runners
+      # have a logged-in session, so the smoke starts it on Cocoa.
       - name: Smoke Test
         timeout-minutes: 15
         run: |
@@ -700,7 +684,28 @@ jobs:
           mkdir -p "$mnt"
           hdiutil attach "dist/$DMG_NAME" -readonly -nobrowse -mountpoint "$mnt"
           trap 'hdiutil detach "$mnt" || hdiutil detach -force "$mnt" || true' EXIT
-          QT_QPA_PLATFORM=minimal .github/scripts/smoke.sh "${RUNNER_TEMP}/pink2d-check/pink2d" "$mnt/Pinkcoin-Qt.app/Contents/MacOS/Pinkcoin-Qt"
+          QT_QPA_PLATFORM=cocoa .github/scripts/smoke.sh "${RUNNER_TEMP}/pink2d-check/pink2d" "$mnt/Pinkcoin-Qt.app/Contents/MacOS/Pinkcoin-Qt"
+
+      # After the test and the smoke test, so that it covers both. macOS
+      # writes a symbolicated report to DiagnosticReports when a process
+      # aborts or crashes (under the user's Library, or /Library's for a
+      # process outside a login session). Without this the only evidence of a
+      # crash is a line on stderr, which names the signal or exception type but
+      # not where it happened.
+      - name: Dump crash reports on failure
+        if: failure()
+        run: |
+          for dir in ~/Library/Logs/DiagnosticReports /Library/Logs/DiagnosticReports; do
+            echo "=== $dir ==="
+            ls -la "$dir" 2>/dev/null || echo "  (none)"
+            for f in "$dir"/*pink2* "$dir"/*Pinkcoin*; do
+              [ -e "$f" ] || continue
+              echo "---------- $f"
+              # .ips reports are JSON with a leading metadata line; print raw either way.
+              head -c 20000 "$f"
+              echo
+            done
+          done
 
       - name: Upload Artifacts
         if: ${{ !env.ACT }}
@@ -843,19 +848,6 @@ jobs:
         timeout-minutes: 45
         run: ctest --test-dir build --output-on-failure --timeout 1800
 
-      - name: Dump crash reports on test failure
-        # See the arm64 job.
-        if: failure()
-        run: |
-          echo "=== DiagnosticReports ==="
-          ls -la ~/Library/Logs/DiagnosticReports/ 2>/dev/null || echo "  (none)"
-          for f in ~/Library/Logs/DiagnosticReports/*pink2* ~/Library/Logs/DiagnosticReports/*Pinkcoin*; do
-            [ -e "$f" ] || continue
-            echo "---------- $f"
-            head -c 20000 "$f"
-            echo
-          done
-
       - name: Package (DMG)
         run: cmake --build build --target deploy
 
@@ -915,7 +907,22 @@ jobs:
           mkdir -p "$mnt"
           hdiutil attach "dist/$DMG_NAME" -readonly -nobrowse -mountpoint "$mnt"
           trap 'hdiutil detach "$mnt" || hdiutil detach -force "$mnt" || true' EXIT
-          QT_QPA_PLATFORM=minimal .github/scripts/smoke.sh "${RUNNER_TEMP}/pink2d-check/pink2d" "$mnt/Pinkcoin-Qt.app/Contents/MacOS/Pinkcoin-Qt"
+          QT_QPA_PLATFORM=cocoa .github/scripts/smoke.sh "${RUNNER_TEMP}/pink2d-check/pink2d" "$mnt/Pinkcoin-Qt.app/Contents/MacOS/Pinkcoin-Qt"
+
+      # See the arm64 job.
+      - name: Dump crash reports on failure
+        if: failure()
+        run: |
+          for dir in ~/Library/Logs/DiagnosticReports /Library/Logs/DiagnosticReports; do
+            echo "=== $dir ==="
+            ls -la "$dir" 2>/dev/null || echo "  (none)"
+            for f in "$dir"/*pink2* "$dir"/*Pinkcoin*; do
+              [ -e "$f" ] || continue
+              echo "---------- $f"
+              head -c 20000 "$f"
+              echo
+            done
+          done
 
       - name: Upload Artifacts
         if: ${{ !env.ACT }}
