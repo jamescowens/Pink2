@@ -651,11 +651,16 @@ bool AppInit2(boost::thread_group& threadGroup)
     static boost::interprocess::file_lock lock(pathLockFile.string().c_str());
     if (!lock.try_lock())
         return InitError(strprintf(_("Cannot obtain a lock on data directory %s.  Pinkcoin is probably already running."), strDataDir.c_str()));
-    fInitDataDirLocked = true;
 
 #if !defined(WIN32) && !defined(QT_GUI)
     if (fDaemon)
     {
+        // A lock is not inherited across fork(): the lock above only checks that no
+        // node runs here. Release it, fork, and take it in the child, which keeps it
+        // for the life of the node. Only a child that holds the lock writes the pid
+        // file, so it always names the running node.
+        lock.unlock();
+
         // Daemonize
         pid_t pid = fork();
         if (pid < 0)
@@ -665,7 +670,6 @@ bool AppInit2(boost::thread_group& threadGroup)
         }
         if (pid > 0)
         {
-            CreatePidFile(GetPidFile(), pid);
             fForkedParent = true;
             return true;
         }
@@ -673,8 +677,13 @@ bool AppInit2(boost::thread_group& threadGroup)
         pid_t sid = setsid();
         if (sid < 0)
             fprintf(stderr, "Error: setsid() returned %d errno %d\n", sid, errno);
+
+        if (!lock.try_lock())
+            return InitError(strprintf(_("Cannot obtain a lock on data directory %s.  Pinkcoin is probably already running."), strDataDir.c_str()));
+        CreatePidFile(GetPidFile(), getpid());
     }
 #endif
+    fInitDataDirLocked = true;
 
     // Started after the -daemon fork, so a forked child's thread group only
     // holds threads that exist in the child.
