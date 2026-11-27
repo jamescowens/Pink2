@@ -69,6 +69,14 @@ static void ThreadShutdownStragglerTest(void* parg)
 {
     MilliSleep(60000);
 }
+
+// Test builds only: a registered thread that ignores fShutdown while it holds the wallet DB
+// environment's lock, so the forced path's flush cannot take it.
+static void ThreadShutdownStragglerLockTest(void* parg)
+{
+    LOCK(bitdb.cs_db);
+    MilliSleep(120000);
+}
 #endif
 
 void ExitTimeout(void* parg)
@@ -1138,6 +1146,8 @@ bool AppInit2(boost::thread_group& threadGroup)
     // the shutdown backstop.
     if (GetBoolArg("-shutdownstragglertest"))
         StartCoreThread("test-straggler", ThreadShutdownStragglerTest, NULL);
+    if (GetBoolArg("-shutdownstragglerlocktest"))
+        StartCoreThread("test-straggler-lock", ThreadShutdownStragglerLockTest, NULL);
 #endif
 
     // The daemon's main thread returns to AppInit(), which waits for a shutdown
