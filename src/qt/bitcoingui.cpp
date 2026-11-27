@@ -456,6 +456,12 @@ bool BitcoinGUI::shutdownRPCConsole(unsigned long msTimeout)
     return rpcConsole ? rpcConsole->shutdownExecutor(msTimeout) : true;
 }
 
+void BitcoinGUI::stopPriceUpdates()
+{
+    if (overviewPage)
+        overviewPage->stopPriceUpdates();
+}
+
 BitcoinGUI::~BitcoinGUI()
 {
 

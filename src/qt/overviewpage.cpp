@@ -138,14 +138,28 @@ OverviewPage::OverviewPage(QWidget *parent) :
     // start with displaying the "out of sync" warnings
     showOutOfSyncWarning(true);
 
+    priceManager = 0;
+    priceTimer = 0;
 #if QT_VERSION >= 0x050000
-    // set a timer for price API
+    // set a timer for price API. The page owns the network manager and the timer,
+    // so both go with it, while the application still exists.
     nLastPrice = 0;
     nLastPriceUSD = 0;
-    QTimer *timerPriceAPI = new QTimer();
-    connect(timerPriceAPI, SIGNAL(timeout()), this, SLOT(sendRequest()));
-    timerPriceAPI->start(90 * 1000);
+    priceManager = new QNetworkAccessManager(this);
+    connect(priceManager, SIGNAL(finished(QNetworkReply*)), this, SLOT(handlePriceReply(QNetworkReply*)));
+    priceTimer = new QTimer(this);
+    connect(priceTimer, SIGNAL(timeout()), this, SLOT(sendRequest()));
+    priceTimer->start(90 * 1000);
 #endif
+}
+
+void OverviewPage::stopPriceUpdates()
+{
+    if (priceTimer)
+        priceTimer->stop();
+    if (priceManager)
+        foreach (QNetworkReply *reply, priceManager->findChildren<QNetworkReply*>())
+            reply->abort();
 }
 
 void OverviewPage::handleTransactionClicked(const QModelIndex &index)
@@ -263,8 +277,6 @@ void OverviewPage::updateBtcValueLabel(double nPrice, double nPriceUSD)
     ui->labelBtcValue->setText(QString::number(nPrice * currentBalance / COIN, 'f', 6) + " BTC / $" + QString::number(nPriceUSD * currentBalance / COIN, 'f', 2) + " USD");
 }
 
-QNetworkAccessManager *manager = new QNetworkAccessManager();
-
 void OverviewPage::sendRequest()
 {
     //only update the price once every 60 seconds, don't want to call the API too many times
@@ -273,15 +285,12 @@ void OverviewPage::sendRequest()
         updateBtcValueLabel(nLastPrice, nLastPriceUSD);
     nLastPriceCheck = nTimeNow;
 
-    // decide how to process finished() signal
-    connect(manager,SIGNAL(finished(QNetworkReply*)),this,SLOT(handlePriceReply(QNetworkReply*)));
-
     //build our URL to send GET request to
     QString strURL = "https://api.coingecko.com/api/v3/coins/pinkcoin?localization=false&"
                      "tickers=false&market_data=true&community_data=false&"
                      "developer_data=false&sparkline=false";
 
-    manager->get(QNetworkRequest(QUrl(strURL)));
+    priceManager->get(QNetworkRequest(QUrl(strURL)));
 }
 
 void OverviewPage::handlePriceReply(QNetworkReply *reply)

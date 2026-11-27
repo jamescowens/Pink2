@@ -12,6 +12,8 @@
 
 QT_BEGIN_NAMESPACE
 class QModelIndex;
+class QNetworkAccessManager;
+class QTimer;
 QT_END_NAMESPACE
 
 namespace Ui {
@@ -32,6 +34,8 @@ public:
 
     void setModel(WalletModel *model);
     void showOutOfSyncWarning(bool fShow);
+    /** Shutdown: stop the price timer and abort a price request in flight. */
+    void stopPriceUpdates();
 
 
 public slots:
@@ -57,6 +61,9 @@ private:
     double nLastPrice;
     double nLastPriceUSD;
     int FontID;
+    /** The price API's network manager and timer, owned by this page. */
+    QNetworkAccessManager *priceManager;
+    QTimer *priceTimer;
 
     TxViewDelegate *txdelegate;
     TransactionFilterProxy *filter;

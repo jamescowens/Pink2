@@ -406,6 +406,7 @@ int main(int argc, char *argv[])
                 // return at once, and a call already waiting for this thread stops
                 // waiting when the shutdown below starts.
                 guiref = 0;
+                window.stopPriceUpdates();
                 window.hide();
                 window.setClientModel(0);
                 window.setWalletModel(0, 0);
