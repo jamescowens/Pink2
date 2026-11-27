@@ -923,9 +923,12 @@ bool AppInit2(boost::thread_group& threadGroup)
     }
     printf(" block index %15" PRId64 "ms\n", GetTimeMillis() - nStart);
 
+    // The print-only options end init on purpose: request the stop, so the process
+    // exits 0 as after any requested stop.
     if (GetBoolArg("-printblockindex") || GetBoolArg("-printblocktree"))
     {
         PrintBlockTree();
+        StartShutdown();
         return false;
     }
 
@@ -949,6 +952,7 @@ bool AppInit2(boost::thread_group& threadGroup)
         }
         if (nFound == 0)
             printf("No blocks matching %s were found\n", strMatch.c_str());
+        StartShutdown();
         return false;
     }
 
@@ -1078,7 +1082,10 @@ bool AppInit2(boost::thread_group& threadGroup)
             if (file)
                 LoadExternalBlockFile(file);
         }
-        exit(0);
+        // -loadblock imports and then stops, through the ordered shutdown.
+        printf("Import finished, shutting down (-loadblock)\n");
+        StartShutdown();
+        return false;
     }
 
     boost::filesystem::path pathBootstrap = GetDataDir() / "bootstrap.dat";
