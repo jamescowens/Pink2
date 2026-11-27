@@ -805,6 +805,16 @@ private:
 static boost::mutex* pmutexRPCShutdown = new boost::mutex();
 static ioContext* pRPCIOService = NULL;
 static std::set<AcceptedConnection*>* psetIdleRPCConnections = new std::set<AcceptedConnection*>();
+// Handler threads started and not yet finished. Their connections use the
+// listener's io_service and SSL context, so the listener waits for this to reach
+// zero before those go out of scope.
+static int nRPCConnectionThreads = 0;
+
+static void RPCConnectionThreadDone()
+{
+    boost::mutex::scoped_lock lock(*pmutexRPCShutdown);
+    --nRPCConnectionThreads;
+}
 
 static void SetRPCConnectionIdle(AcceptedConnection* conn, bool fIdle)
 {
@@ -919,9 +929,18 @@ static void RPCAcceptHandler(boost::shared_ptr< basic_socket_acceptor<Protocol> 
     }
 
     // start HTTP client thread
-    else if (!StartCoreThread("rpc-conn", ThreadRPCServer3, conn)) {
-        printf("Failed to create RPC server client thread\n");
-        delete conn;
+    else
+    {
+        {
+            boost::mutex::scoped_lock lock(*pmutexRPCShutdown);
+            ++nRPCConnectionThreads;
+        }
+        if (!StartCoreThread("rpc-conn", ThreadRPCServer3, conn))
+        {
+            printf("Failed to create RPC server client thread\n");
+            delete conn;
+            RPCConnectionThreadDone();
+        }
     }
 
     vnThreadsRunning[THREAD_RPCLISTENER]--;
@@ -1066,6 +1085,21 @@ void ThreadRPCServer2(void* parg)
         pRPCIOService = NULL;
     }
     StopRequests();
+
+    // io_service and context are locals, and every handler thread's connection
+    // uses them: wait until all handlers have finished before they go out of
+    // scope. StopRPCThreads() has woken the idle ones; busy ones finish their
+    // request first. If a handler is still running at the shutdown deadline, this
+    // thread is still waiting here, and Shutdown() reports it as a straggler.
+    while (true)
+    {
+        {
+            boost::mutex::scoped_lock lock(*pmutexRPCShutdown);
+            if (nRPCConnectionThreads == 0)
+                break;
+        }
+        MilliSleep(10);
+    }
 }
 
 class JSONRequest
@@ -1170,6 +1204,7 @@ void ThreadRPCServer3(void* parg)
                 LOCK(cs_THREAD_RPCHANDLER);
                 --vnThreadsRunning[THREAD_RPCHANDLER];
             }
+            RPCConnectionThreadDone();
             return;
         }
 
@@ -1255,6 +1290,7 @@ void ThreadRPCServer3(void* parg)
         LOCK(cs_THREAD_RPCHANDLER);
         vnThreadsRunning[THREAD_RPCHANDLER]--;
     }
+    RPCConnectionThreadDone();
 }
 
 json_spirit::Value CRPCTable::execute(const std::string &strMethod, const json_spirit::Array &params) const

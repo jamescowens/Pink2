@@ -91,6 +91,10 @@ CCriticalSection cs_smsgDB;
 
 leveldb::DB *smsgDB = NULL;
 
+// Started at init or by smsgenable, and not disabled since, so Shutdown() must
+// save smsg.ini and close the DB once the threads are joined.
+static bool fSecMsgStarted = false;
+
 
 namespace fs = boost::filesystem;
 
@@ -1072,9 +1076,8 @@ int SecureMsgReadIni()
 
 int SecureMsgWriteIni()
 {
-    if (!fSecMsgenabled)
-        return false;
-    
+    // Not gated on fSecMsgenabled: smsgdisable and shutdown clear it to stop the
+    // secure-messaging threads, and then save the options and keys here.
     if (fDebugSmsg)
         printf("SecureMsgWriteIni()\n");
     
@@ -1170,32 +1173,36 @@ bool SecureMsgStart(bool fScanChain)
         return false;
     };
     
+    fSecMsgStarted = true;
     return true;
 };
 
-/** called from Shutdown() in init.cpp */
+void SecureMsgSignalShutdown()
+{
+    fSecMsgenabled = false;
+}
+
+/** called from Shutdown() in init.cpp, after the secure-messaging threads are joined */
 bool SecureMsgShutdown()
 {
-    if (!fSecMsgenabled)
+    if (!fSecMsgStarted)
         return false;
-    
+    fSecMsgStarted = false;
+
     printf("Stopping secure messaging.\n");
-    
-    
+
     if (SecureMsgWriteIni() != 0)
         printf("Failed to save smsg.ini\n");
-    
+
     fSecMsgenabled = false;
-    
+
     if (smsgDB)
     {
         LOCK(cs_smsgDB);
         delete smsgDB;
         smsgDB = NULL;
     };
-    
-    // -- main program will wait 5 seconds for threads to terminate.
-    
+
     return true;
 };
 
@@ -1253,6 +1260,7 @@ bool SecureMsgEnable()
         };
     }
     
+    fSecMsgStarted = true;
     printf("Secure messaging enabled.\n");
     return true;
 };
@@ -1311,6 +1319,7 @@ bool SecureMsgDisable()
     };
     
     
+    fSecMsgStarted = false;
     printf("Secure messaging disabled.\n");
     return true;
 };

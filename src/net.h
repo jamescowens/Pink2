@@ -44,6 +44,8 @@ unsigned short GetListenPort();
 bool BindListenPort(const CService &bindAddr, std::string& strError=REF(std::string()));
 void StartNode(void* parg);
 bool StopNode();
+/** Write the address manager to peers.dat. */
+void DumpAddresses();
 void SocketSendData(CNode *pnode);
 
 enum

@@ -216,6 +216,7 @@ std::string FormatSubVersion(const std::string& name, int nClientVersion, const 
 void CompareTimeWithPeers(const std::vector<int64_t>& vSorted);
 void AddTimeData(const CNetAddr& ip, int64_t nTime, bool fSyncTime = false);
 void runCommand(std::string strCommand);
+void StartNotifyCommand(const std::string& strCommand);
 
 
 

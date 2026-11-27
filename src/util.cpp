@@ -30,6 +30,7 @@ namespace boost {
 #include <boost/chrono.hpp>
 #include <boost/shared_ptr.hpp>
 #include <algorithm>
+#include <memory>
 #include <mutex>
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
@@ -1360,6 +1361,24 @@ void runCommand(std::string strCommand)
     int nErr = ::system(strCommand.c_str());
     if (nErr)
         printf("runCommand error: system(%s) returned %d\n", strCommand.c_str(), nErr);
+}
+
+// Thread entry for a notification command; parg is a heap std::string.
+static void ThreadNotifyCommand(void* parg)
+{
+    std::unique_ptr<std::string> pstrCommand(static_cast<std::string*>(parg));
+    runCommand(*pstrCommand);
+}
+
+// Runs a -walletnotify, -blocknotify or -alertnotify command on its own thread.
+// The thread is registered, so shutdown joins a command that is still running
+// with every other thread, against the same deadline. Once shutdown has begun,
+// no new command starts.
+void StartNotifyCommand(const std::string& strCommand)
+{
+    std::string* pstrCommand = new std::string(strCommand);
+    if (!StartCoreThread("notify", ThreadNotifyCommand, pstrCommand))
+        delete pstrCommand;
 }
 
 void RenameThread(const char* name)

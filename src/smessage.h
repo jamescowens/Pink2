@@ -328,6 +328,10 @@ int SecureMsgReadIni();
 int SecureMsgWriteIni();
 
 bool SecureMsgStart(bool fScanChain);
+/** Signal the secure-messaging threads to stop; Shutdown() then joins them. */
+void SecureMsgSignalShutdown();
+/** After its threads are joined: save smsg.ini and close the message DB, if
+ *  secure messaging was started (at init or by smsgenable). */
 bool SecureMsgShutdown();
 
 bool SecureMsgEnable();
