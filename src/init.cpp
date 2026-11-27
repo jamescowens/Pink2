@@ -89,12 +89,13 @@ void ExitTimeout(void* parg)
 
 void StartShutdown()
 {
+    // One request flag for every build: the daemon's main thread waits for it in
+    // AppInit(), the GUI polls it, and init checks it between stages, so a request
+    // made at any time is acted on.
+    fRequestShutdown = true;
 #ifdef QT_GUI
     // ensure we leave the Qt main loop for a clean GUI exit (Shutdown() is called in bitcoin.cpp afterwards)
     uiInterface.QueueShutdown();
-#else
-    // The main thread waits for this in AppInit() and runs Shutdown() there.
-    fRequestShutdown = true;
 #endif
 }
 
@@ -455,6 +456,17 @@ bool InitSanityCheck(void)
 /** Initialize bitcoin.
  *  @pre Parameters should be parsed and config file should be read.
  */
+// Init checks this between stages: a shutdown requested while init runs (SIGTERM,
+// or a stop) ends init there, and the caller runs the ordered shutdown for the
+// stages that ran.
+static bool InitShutdownRequested(const char* pszStage)
+{
+    if (!fRequestShutdown)
+        return false;
+    printf("Shutdown requested during init (%s)\n", pszStage);
+    return true;
+}
+
 bool AppInit2(boost::thread_group& threadGroup)
 {
     // ********************************************************* Step 1: setup
@@ -1051,6 +1063,9 @@ bool AppInit2(boost::thread_group& threadGroup)
         printf(" rescan      %15" PRId64 "ms\n", GetTimeMillis() - nStart);
     }
 
+    if (InitShutdownRequested("wallet loaded"))
+        return false;
+
     // ********************************************************* Step 10: import blocks
 
     if (mapArgs.count("-loadblock"))
@@ -1118,10 +1133,16 @@ bool AppInit2(boost::thread_group& threadGroup)
     printf("mapWallet.size() = %" PRIszu "\n",       pwalletMain->mapWallet.size());
     printf("mapAddressBook.size() = %" PRIszu "\n",  pwalletMain->mapAddressBook.size());
 
+    if (InitShutdownRequested("before starting the node"))
+        return false;
+
     if (!StartCoreThread("net-start", StartNode, NULL))
         InitError(_("Error: could not start node"));
     else
         fInitNodeStarted = true;
+
+    if (InitShutdownRequested("before starting RPC"))
+        return false;
 
     if (fServer)
         StartCoreThread("rpc-listener", ThreadRPCServer, NULL);
