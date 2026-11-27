@@ -112,26 +112,36 @@ bool ShutdownStopThreads(int64_t nTimeoutMillis)
     // The calling thread is not renamed: in the daemon it is the main thread, and
     // scripts that wait for the process name to disappear must not see it vanish
     // while shutdown is still flushing.
-    printf("Shutdown: requested\n");
+    // A process that never locked the data directory started no threads, and its
+    // lines would land in the debug.log of the node that holds the lock.
+    if (fInitDataDirLocked)
+        printf("Shutdown: requested\n");
     nShutdownStartMillis = GetTimeMillis();
 
     fRequestShutdown = true;
     fShutdown = true;
     nTransactionsUpdated++;
 
-    // Wake the threads that a flag alone doesn't reach.
+    // Wake the threads that a flag alone doesn't reach. StopNode() also logs, and
+    // an instance that never started the node has no connection threads to wake.
     StopRPCThreads();
-    StopNode();
+    if (fInitNodeStarted)
+        StopNode();
     SecureMsgSignalShutdown();
 
     size_t nThreads = CoreThreadCount();
     std::vector<std::string> vStragglers;
     fResult = JoinCoreThreads(nTimeoutMillis, vStragglers);
     if (fResult)
-        printf("Shutdown: all %d threads stopped in %d ms\n", (int)nThreads, (int)(GetTimeMillis() - nShutdownStartMillis));
+    {
+        if (fInitDataDirLocked)
+            printf("Shutdown: all %d threads stopped in %d ms\n", (int)nThreads, (int)(GetTimeMillis() - nShutdownStartMillis));
+    }
     else
+    {
         printf("Shutdown: %d threads did not stop within %d s: %s\n", (int)vStragglers.size(),
                (int)(nTimeoutMillis / 1000), boost::algorithm::join(vStragglers, ", ").c_str());
+    }
     return fResult;
 }
 
@@ -186,7 +196,8 @@ void ShutdownFinish(bool fClean)
     // Bound the rest of the teardown (Qt, static destructors) on Windows.
     NewThread(ExitTimeout, NULL);
 #endif
-    printf("Pinkcoin exited\n\n");
+    if (fInitDataDirLocked)
+        printf("Pinkcoin exited\n\n");
 }
 
 void Shutdown(void* parg)
