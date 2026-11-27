@@ -346,6 +346,19 @@ void HandleSIGHUP(int)
     fReopenDebugLog = true;
 }
 
+#if defined(WIN32) && !defined(QT_GUI)
+// Ctrl-C, Ctrl-Break, closing the console window, logoff and system shutdown. The
+// handler runs on its own thread: request the shutdown and wait here, because
+// returning lets Windows end the process at once. The main thread runs the ordered
+// shutdown and ends the process.
+static BOOL WINAPI HandleConsoleCtrl(DWORD dwCtrlType)
+{
+    fRequestShutdown = true;
+    Sleep(INFINITE);
+    return TRUE;
+}
+#endif
+
 
 
 
@@ -641,6 +654,9 @@ bool AppInit2(boost::thread_group& threadGroup)
     sigemptyset(&sa_hup.sa_mask);
     sa_hup.sa_flags = 0;
     sigaction(SIGHUP, &sa_hup, NULL);
+#endif
+#if defined(WIN32) && !defined(QT_GUI)
+    SetConsoleCtrlHandler(HandleConsoleCtrl, TRUE);
 #endif
 
     // ********************************************************* Step 2: parameter interactions
