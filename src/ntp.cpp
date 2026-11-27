@@ -228,6 +228,9 @@ bool SetNTPOffset(const string &strPool)
 
     while (tCount < 4)
     {
+        if (fShutdown)
+            return false;
+
         // Start with a fresh vector to hold our NTP Times
         ntpMicros.clear();
         avMicros = 0;
@@ -258,7 +261,16 @@ bool SetNTPOffset(const string &strPool)
 
         // Ideally we want times from NTP servers that can respond to us in < 500ms.
         // We'll wait longer if we don't get what we need.
-        boost::this_thread::sleep_for(boost::chrono::milliseconds(500 * nWait));
+        if (!ShutdownSleep(500 * nWait))
+        {
+            // Stopping: join this round's queries (each ends within its 2 s receive
+            // timeout) and leave the offset as it is.
+            nGet1.join();
+            nGet2.join();
+            nGet3.join();
+            nGet4.join();
+            return false;
+        }
 
         // Get this now so we know exactly when we woke up again.
         // Helps us get an accurate offset.
