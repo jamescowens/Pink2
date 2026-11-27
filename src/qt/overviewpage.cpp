@@ -271,6 +271,9 @@ void OverviewPage::showOutOfSyncWarning(bool fShow)
 }
 
 uint nLastPriceCheck = 0;
+
+// A price request follows at most this many redirects.
+static const int MAX_PRICE_REDIRECTS = 3;
 // #if QT_VERSION >= 0x050000
 void OverviewPage::updateBtcValueLabel(double nPrice, double nPriceUSD)
 {
@@ -336,12 +339,17 @@ void OverviewPage::handlePriceReply(QNetworkReply *reply)
         }
         else if (v >= 300 && v < 400) // Redirection
         {
+            int nRedirects = reply->request().attribute(QNetworkRequest::User).toInt();
+            if (nRedirects >= MAX_PRICE_REDIRECTS)
+                return;
+
             // Get the redirection url
             QUrl newUrl = reply->attribute(QNetworkRequest::RedirectionTargetAttribute).toUrl();
             newUrl = reply->url().resolved(newUrl);
 
             QNetworkAccessManager *manager = reply->manager();
             QNetworkRequest redirection(newUrl);
+            redirection.setAttribute(QNetworkRequest::User, nRedirects + 1);
             manager->get(redirection);
 
             return;
