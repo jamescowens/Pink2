@@ -7,7 +7,8 @@
 #      127.0.0.1 arrives as ::ffff:127.0.0.1 and is allowed only through the
 #      IPv4-mapped path in ClientAllowed(); a LAN address must get HTTP 403.
 # Pinkcoin-Qt, if given, gets RPC stop too, and its shutdown lines from
-# debug.log are printed, so a run shows how far the shutdown got.
+# debug.log are printed, so a run shows how far the shutdown got. Each process
+# must exit with status 0 after stop.
 # The daemon runs in the foreground (backgrounded here), not with -daemon:
 # -daemon aborts on macOS in 2.4.0.0 (objc fork safety), a separate bug.
 set -uo pipefail
@@ -74,6 +75,8 @@ grep -q '"testnet" : true' "$D/getinfo.json" || fail "getinfo did not report tes
 [ "$(cli getblockcount)" = 0 ] || fail "unexpected block count"
 cli stop
 wait_exit "$P" 60 || fail "pink2d did not exit after stop"
+rc=0; wait "$P" || rc=$?
+[ "$rc" = 0 ] || fail "pink2d exited with status $rc after stop"
 
 echo "== pink2d, dual-stack listener (-rpcallowip set)"
 "$B" "${A[@]}" -rpcallowip=10.255.255.254 &
@@ -92,6 +95,8 @@ else
 fi
 cli stop
 wait_exit "$P" 60 || fail "pink2d did not exit after stop"
+rc=0; wait "$P" || rc=$?
+[ "$rc" = 0 ] || fail "pink2d exited with status $rc after stop"
 
 if [ -n "$G" ]; then
     echo "== Pinkcoin-Qt (${QT_QPA_PLATFORM:-offscreen})"
@@ -104,14 +109,16 @@ if [ -n "$G" ]; then
     # 40 s is longer than the 30 s shutdown deadline, so a forced exit shows
     # here as an exit rather than as a kill.
     if wait_exit "$P" 40; then
-        wait "$P"
-        echo "Pinkcoin-Qt exited with status $?"
+        rc=0; wait "$P" || rc=$?
+        echo "Pinkcoin-Qt exited with status $rc"
         gui_log
+        [ "$rc" = 0 ] || fail "Pinkcoin-Qt exited with status $rc after RPC stop"
     else
-        echo "::warning::Pinkcoin-Qt did not exit within 40 s of RPC stop (as in 2.4.0.0); killing it"
+        echo "::error::Pinkcoin-Qt did not exit within 40 s of RPC stop"
         gui_log
         kill "$P"
         wait_exit "$P" 10 || kill -9 "$P"
+        exit 1
     fi
 fi
 
