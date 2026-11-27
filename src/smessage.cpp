@@ -1183,13 +1183,24 @@ void SecureMsgSignalShutdown()
 }
 
 /** called from Shutdown() in init.cpp, after the secure-messaging threads are joined */
-bool SecureMsgShutdown()
+bool SecureMsgShutdown(bool fCloseDB)
 {
     if (!fSecMsgStarted)
         return false;
     fSecMsgStarted = false;
 
     printf("Stopping secure messaging.\n");
+
+    if (!fCloseDB)
+    {
+        // Forced shutdown: a secure-messaging thread may still be running. Save
+        // smsg.ini if nothing holds cs_smsg, and leave the DB open.
+        fSecMsgenabled = false;
+        TRY_LOCK(cs_smsg, lockSmsg);
+        if (!lockSmsg || SecureMsgWriteIni() != 0)
+            printf("Failed to save smsg.ini\n");
+        return true;
+    }
 
     if (SecureMsgWriteIni() != 0)
         printf("Failed to save smsg.ini\n");

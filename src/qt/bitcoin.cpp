@@ -297,10 +297,28 @@ int main(int argc, char *argv[])
                 // it first. It shares the shutdown deadline with the core threads.
                 int64_t nStart = GetTimeMillis();
                 bool fConsoleStopped = window.shutdownRPCConsole(SHUTDOWN_JOIN_TIMEOUT_MS);
+#ifdef PINK2_SHUTDOWN_TEST_HOOKS
+                // Test builds only: behave as if a console command had used up the whole
+                // deadline, to exercise the GUI's forced shutdown path.
+                if (GetBoolArg("-shutdownconsolestucktest"))
+                {
+                    fConsoleStopped = false;
+                    nStart -= SHUTDOWN_JOIN_TIMEOUT_MS;
+                }
+#endif
                 if (!fConsoleStopped)
                     printf("Shutdown: rpcconsole-executor did not stop within %d s\n", (int)(SHUTDOWN_JOIN_TIMEOUT_MS / 1000));
-                int64_t nLeft = std::max<int64_t>(0, SHUTDOWN_JOIN_TIMEOUT_MS - (GetTimeMillis() - nStart));
+                // Give the core threads at least a few seconds even if the console used
+                // up the deadline: most stop within a second, and each one that stops is
+                // one fewer running through the forced path.
+                static const int64_t SHUTDOWN_MIN_JOIN_MS = 5000;
+                int64_t nLeft = std::max<int64_t>(SHUTDOWN_MIN_JOIN_MS, SHUTDOWN_JOIN_TIMEOUT_MS - (GetTimeMillis() - nStart));
                 fClean = ShutdownStopThreads(nLeft) && fConsoleStopped;
+
+                // Forced path: a thread may still call into the models, so leave from
+                // here, before they are destroyed. ShutdownFinish(false) does not return.
+                if (!fClean)
+                    ShutdownFinish(false);
             }
             // Shutdown the core and free the wallets, but don't exit Bitcoin-Qt here
             ShutdownFinish(fClean);

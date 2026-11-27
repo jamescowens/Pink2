@@ -100,8 +100,9 @@ bool ShutdownStopThreads(int64_t nTimeoutMillis)
         return fResult;
     fDone = true;
 
-    // Make this thread recognisable as the shutdown thread
-    RenameThread("pinkcoin-shutoff");
+    // The calling thread is not renamed: in the daemon it is the main thread, and
+    // scripts that wait for the process name to disappear must not see it vanish
+    // while shutdown is still flushing.
     printf("Shutdown: requested\n");
     nShutdownStartMillis = GetTimeMillis();
 
@@ -121,7 +122,7 @@ bool ShutdownStopThreads(int64_t nTimeoutMillis)
         printf("Shutdown: all %d threads stopped in %d ms\n", (int)nThreads, (int)(GetTimeMillis() - nShutdownStartMillis));
     else
         printf("Shutdown: %d threads did not stop within %d s: %s\n", (int)vStragglers.size(),
-               (int)(SHUTDOWN_JOIN_TIMEOUT_MS / 1000), boost::algorithm::join(vStragglers, ", ").c_str());
+               (int)(nTimeoutMillis / 1000), boost::algorithm::join(vStragglers, ", ").c_str());
     return fResult;
 }
 
@@ -134,7 +135,9 @@ void ShutdownFinish(bool fClean)
 
     if (fInitNodeStarted)
         DumpAddresses();
-    SecureMsgShutdown();
+    // On the forced path a secure-messaging thread may still be running, so its DB
+    // stays open (LevelDB writes through) and only smsg.ini is saved.
+    SecureMsgShutdown(fClean);
     if (fInitDataDirLocked)
         bitdb.Flush(false);
 
