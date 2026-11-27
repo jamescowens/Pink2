@@ -25,6 +25,7 @@
 #include <boost/filesystem/fstream.hpp>
 #include <boost/shared_ptr.hpp>
 #include <list>
+#include <set>
 
 // Boost Support for 1.70+
 #if BOOST_VERSION >= 107000
@@ -745,6 +746,9 @@ public:
     virtual std::iostream& stream() = 0;
     virtual std::string peer_address_to_string() const = 0;
     virtual void close() = 0;
+    /** Shut the OS socket down so the handler thread wakes and ends. The
+     *  owning handler thread still closes and deletes the connection. */
+    virtual void shutdownSocket() = 0;
 };
 
 template <typename Protocol>
@@ -776,6 +780,15 @@ public:
         _stream.close();
     }
 
+    virtual void shutdownSocket()
+    {
+#ifdef WIN32
+        ::shutdown(sslStream.lowest_layer().native_handle(), SD_BOTH);
+#else
+        ::shutdown(sslStream.lowest_layer().native_handle(), SHUT_RDWR);
+#endif
+    }
+
     typename Protocol::endpoint peer;
     asio::ssl::stream<typename Protocol::socket> sslStream;
 
@@ -783,6 +796,33 @@ private:
     SSLIOStreamDevice<Protocol> _d;
     iostreams::stream< SSLIOStreamDevice<Protocol> > _stream;
 };
+
+// Shutdown wake-ups. The listener's io_service, and the connections whose
+// handler is waiting for the next request (idle), so StopRPCThreads() can wake
+// them. A connection is idle only between requests, so shutdown never cuts a
+// reply short. Allocated once and never freed, so static teardown can't
+// destroy them under a late thread.
+static boost::mutex* pmutexRPCShutdown = new boost::mutex();
+static ioContext* pRPCIOService = NULL;
+static std::set<AcceptedConnection*>* psetIdleRPCConnections = new std::set<AcceptedConnection*>();
+
+static void SetRPCConnectionIdle(AcceptedConnection* conn, bool fIdle)
+{
+    boost::mutex::scoped_lock lock(*pmutexRPCShutdown);
+    if (fIdle)
+        psetIdleRPCConnections->insert(conn);
+    else
+        psetIdleRPCConnections->erase(conn);
+}
+
+void StopRPCThreads()
+{
+    boost::mutex::scoped_lock lock(*pmutexRPCShutdown);
+    if (pRPCIOService)
+        pRPCIOService->stop();
+    BOOST_FOREACH(AcceptedConnection* conn, *psetIdleRPCConnections)
+        conn->shutdownSocket();
+}
 
 void ThreadRPCServer(void* parg)
 {
@@ -869,6 +909,12 @@ static void RPCAcceptHandler(boost::shared_ptr< basic_socket_acceptor<Protocol> 
         // Only send a 403 if we're not using SSL to prevent a DoS during the SSL handshake.
         if (!fUseSSL)
             conn->stream() << HTTPReply(HTTP_FORBIDDEN, "", false) << std::flush;
+        delete conn;
+    }
+
+    // Shutting down: don't start a handler for a new connection
+    else if (fShutdown)
+    {
         delete conn;
     }
 
@@ -1005,10 +1051,20 @@ void ThreadRPCServer2(void* parg)
         return;
     }
 
+    {
+        // Set before the loop checks fShutdown, so a StopRPCThreads() that runs
+        // first is seen by the check, and one that runs later stops run_one().
+        boost::mutex::scoped_lock lock(*pmutexRPCShutdown);
+        pRPCIOService = &io_service;
+    }
     vnThreadsRunning[THREAD_RPCLISTENER]--;
     while (!fShutdown)
         io_service.run_one();
     vnThreadsRunning[THREAD_RPCLISTENER]++;
+    {
+        boost::mutex::scoped_lock lock(*pmutexRPCShutdown);
+        pRPCIOService = NULL;
+    }
     StopRequests();
 }
 
@@ -1102,8 +1158,12 @@ void ThreadRPCServer3(void* parg)
     bool fRun = true;
     while (true)
     {
+        // Idle until the next request has been read; StopRPCThreads() can wake
+        // an idle connection. Marked before checking fShutdown so no wake-up is lost.
+        SetRPCConnectionIdle(conn, true);
         if (fShutdown || !fRun)
         {
+            SetRPCConnectionIdle(conn, false);
             conn->close();
             delete conn;
             {
@@ -1123,6 +1183,11 @@ void ThreadRPCServer3(void* parg)
 
         // Read HTTP message headers and body
         ReadHTTPMessage(conn->stream(), mapHeaders, strRequest, nProto);
+
+        // Busy from here until the reply is written
+        SetRPCConnectionIdle(conn, false);
+        if (fShutdown)
+            break;
 
         // Check authorization
         if (mapHeaders.count("authorization") == 0)
@@ -1184,6 +1249,7 @@ void ThreadRPCServer3(void* parg)
         }
     }
 
+    SetRPCConnectionIdle(conn, false);
     delete conn;
     {
         LOCK(cs_THREAD_RPCHANDLER);

@@ -100,6 +100,7 @@ void Shutdown(void* parg)
         nTransactionsUpdated++;
 //        CTxDB().Close();
         bitdb.Flush(false);
+        StopRPCThreads(); // temporary placement; the ordered shutdown moves it
         StopNode();
         bitdb.Flush(true);
         boost::filesystem::remove(GetPidFile());
