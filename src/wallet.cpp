@@ -3137,7 +3137,7 @@ DBErrors CWallet::LoadWallet(bool& fFirstRunRet)
         return nLoadWalletRet;
     fFirstRunRet = !vchDefaultKey.IsValid();
 
-    NewThread(ThreadFlushWalletDB, &strWalletFile);
+    StartCoreThread("wallet-flush", ThreadFlushWalletDB, &strWalletFile);
     return DB_LOAD_OK;
 }
 
@@ -3151,7 +3151,7 @@ SDBErrors CWallet::LoadStakeDB(bool& fFirstRunRet)
     if (nLoadStakeDBRet != SDB_LOAD_OK)
         return nLoadStakeDBRet;
 
-    NewThread(ThreadFlushStakeDB, &strWalletFile);
+    StartCoreThread("stakedb-flush", ThreadFlushStakeDB, &strWalletFile);
     return SDB_LOAD_OK;
 }
 

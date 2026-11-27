@@ -1252,7 +1252,7 @@ void MapPort()
 {
     if (fUseUPnP && vnThreadsRunning[THREAD_UPNP] < 1)
     {
-        if (!NewThread(ThreadMapPort, NULL))
+        if (!StartCoreThread("net-upnp", ThreadMapPort, NULL))
             printf("Error: ThreadMapPort(ThreadMapPort) failed\n");
     }
 }
@@ -1313,7 +1313,8 @@ void ThreadDNSAddressSeed2(void* parg)
     // goal: only query DNS seeds if address need is acute
     if ((addrman.size() > 0) &&
         (!GetBoolArg("-forcednsseed", false))) {
-        MilliSleep(11 * 1000);
+        if (!ShutdownSleep(11 * 1000))
+            return;
 
         LOCK(cs_vNodes);
         if (vNodes.size() >= 2) {
@@ -1327,6 +1328,8 @@ void ThreadDNSAddressSeed2(void* parg)
     printf("Loading addresses from DNS seeds (could take a while)\n");
 
     for (unsigned int seed_idx = 0; seed_idx < ARRAYLEN(strDNSSeed); seed_idx++) {
+        if (fShutdown)
+            return;
         if (HaveNameProxy()) {
             AddOneShot(strDNSSeed[seed_idx][1]);
         } else {
@@ -1385,7 +1388,7 @@ void ThreadDumpAddress2(void* parg)
     {
         DumpAddresses();
         vnThreadsRunning[THREAD_DUMPADDRESS]--;
-        MilliSleep(600000);
+        ShutdownSleep(600000);
         vnThreadsRunning[THREAD_DUMPADDRESS]++;
     }
     vnThreadsRunning[THREAD_DUMPADDRESS]--;
@@ -1633,7 +1636,7 @@ void ThreadOpenAddedConnections2(void* parg)
                     return;
             }
             vnThreadsRunning[THREAD_ADDEDCONNECTIONS]--;
-            MilliSleep(120000); // Retry every 2 minutes
+            ShutdownSleep(120000); // Retry every 2 minutes
             vnThreadsRunning[THREAD_ADDEDCONNECTIONS]++;
         }
         return;
@@ -1687,7 +1690,7 @@ void ThreadOpenAddedConnections2(void* parg)
         if (fShutdown)
             return;
         vnThreadsRunning[THREAD_ADDEDCONNECTIONS]--;
-        MilliSleep(120000); // Retry every 2 minutes
+        ShutdownSleep(120000); // Retry every 2 minutes
         vnThreadsRunning[THREAD_ADDEDCONNECTIONS]++;
         if (fShutdown)
             return;
@@ -1977,7 +1980,7 @@ void static Discover()
 
     // Don't use external IPv4 discovery, when -onlynet="IPv6"
     if (!IsLimited(NET_IPV4))
-        NewThread(ThreadGetMyExternalIP, NULL);
+        StartCoreThread("net-extip", ThreadGetMyExternalIP, NULL);
 }
 
 void StartNode(void* parg)
@@ -2005,39 +2008,39 @@ void StartNode(void* parg)
     if (!GetBoolArg("-dnsseed", true))
         printf("DNS seeding disabled\n");
     else
-        if (!NewThread(ThreadDNSAddressSeed, NULL))
-            printf("Error: NewThread(ThreadDNSAddressSeed) failed\n");
+        if (!StartCoreThread("net-dnsseed", ThreadDNSAddressSeed, NULL))
+            printf("Error: StartCoreThread(ThreadDNSAddressSeed) failed\n");
 
     // Map ports with UPnP
     if (fUseUPnP)
         MapPort();
 
     // Send and receive from sockets, accept connections
-    if (!NewThread(ThreadSocketHandler, NULL))
-        printf("Error: NewThread(ThreadSocketHandler) failed\n");
+    if (!StartCoreThread("net-socket", ThreadSocketHandler, NULL))
+        printf("Error: StartCoreThread(ThreadSocketHandler) failed\n");
 
     // Initiate outbound connections from -addnode
-    if (!NewThread(ThreadOpenAddedConnections, NULL))
-        printf("Error: NewThread(ThreadOpenAddedConnections) failed\n");
+    if (!StartCoreThread("net-addcon", ThreadOpenAddedConnections, NULL))
+        printf("Error: StartCoreThread(ThreadOpenAddedConnections) failed\n");
 
     // Initiate outbound connections
-    if (!NewThread(ThreadOpenConnections, NULL))
-        printf("Error: NewThread(ThreadOpenConnections) failed\n");
+    if (!StartCoreThread("net-opencon", ThreadOpenConnections, NULL))
+        printf("Error: StartCoreThread(ThreadOpenConnections) failed\n");
 
     // Process messages
-    if (!NewThread(ThreadMessageHandler, NULL))
-        printf("Error: NewThread(ThreadMessageHandler) failed\n");
+    if (!StartCoreThread("net-msghand", ThreadMessageHandler, NULL))
+        printf("Error: StartCoreThread(ThreadMessageHandler) failed\n");
 
     // Dump network addresses
-    if (!NewThread(ThreadDumpAddress, NULL))
-        printf("Error; NewThread(ThreadDumpAddress) failed\n");
+    if (!StartCoreThread("net-dumpaddr", ThreadDumpAddress, NULL))
+        printf("Error: StartCoreThread(ThreadDumpAddress) failed\n");
 
     // Mine proof-of-stake blocks in the background
     if (!GetBoolArg("-staking", true))
         printf("Staking disabled\n");
     else
-        if (!NewThread(ThreadStakeMiner, pwalletMain))
-            printf("Error: NewThread(ThreadStakeMiner) failed\n");
+        if (!StartCoreThread("stake-miner", ThreadStakeMiner, pwalletMain))
+            printf("Error: StartCoreThread(ThreadStakeMiner) failed\n");
 }
 
 bool StopNode()

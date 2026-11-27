@@ -109,6 +109,33 @@ BOOST_AUTO_TEST_CASE(registry_prunes_finished)
     BOOST_CHECK_EQUAL(CoreThreadCount(), 1U);
 }
 
+namespace {
+std::atomic<bool> fChildStarted(false);
+void StartChild(void*)
+{
+    // A registered thread starting another one (as StartNode does) must not try
+    // to join itself while pruning.
+    fChildStarted = StartCoreThread("test-child", LoopUntilShutdown, NULL);
+    while (!fShutdown)
+        ShutdownSleep(50);
+}
+}
+
+BOOST_AUTO_TEST_CASE(registry_start_from_registered_thread)
+{
+    fChildStarted = false;
+    BOOST_REQUIRE(StartCoreThread("test-parent", StartChild, NULL));
+    for (int i = 0; i < 100 && !fChildStarted; i++)
+        MilliSleep(10);
+    BOOST_CHECK(fChildStarted);
+    BOOST_CHECK_EQUAL(CoreThreadCount(), 2U);
+
+    fShutdown = true;
+    std::vector<std::string> v;
+    BOOST_CHECK(JoinCoreThreads(2000, v));
+    BOOST_CHECK(v.empty());
+}
+
 BOOST_AUTO_TEST_CASE(registry_refuses_after_shutdown)
 {
     fShutdown = true;

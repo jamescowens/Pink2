@@ -1162,8 +1162,8 @@ bool SecureMsgStart(bool fScanChain)
     };
     
     // -- start threads
-    if (!NewThread(ThreadSecureMsg, NULL)
-        || !NewThread(ThreadSecureMsgPow, NULL))
+    if (!StartCoreThread("smsg", ThreadSecureMsg, NULL)
+        || !StartCoreThread("smsg-pow", ThreadSecureMsgPow, NULL))
     {
         printf("SecureMsg could not start threads, secure messaging disabled.\n");
         fSecMsgenabled = false;
@@ -1235,8 +1235,8 @@ bool SecureMsgEnable()
     }; // LOCK(cs_smsg);
     
     // -- start threads
-    if (!NewThread(ThreadSecureMsg, NULL)
-        || !NewThread(ThreadSecureMsgPow, NULL))
+    if (!StartCoreThread("smsg", ThreadSecureMsg, NULL)
+        || !StartCoreThread("smsg-pow", ThreadSecureMsgPow, NULL))
     {
         printf("SecureMsgenable could not start threads, secure messaging disabled.\n");
         fSecMsgenabled = false;

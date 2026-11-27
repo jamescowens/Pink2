@@ -873,7 +873,7 @@ static void RPCAcceptHandler(boost::shared_ptr< basic_socket_acceptor<Protocol> 
     }
 
     // start HTTP client thread
-    else if (!NewThread(ThreadRPCServer3, conn)) {
+    else if (!StartCoreThread("rpc-conn", ThreadRPCServer3, conn)) {
         printf("Failed to create RPC server client thread\n");
         delete conn;
     }

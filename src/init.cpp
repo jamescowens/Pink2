@@ -43,6 +43,13 @@ enum Checkpoints::CPMode CheckpointsMode;
 // Shutdown
 //
 
+// Thread entry for the NTP sync thread; parg is a heap std::string with the
+// pool name, kept for the life of the process.
+static void ThreadNTPUpdateEntry(void* parg)
+{
+    threadNTPUpdate(*static_cast<std::string*>(parg));
+}
+
 void ExitTimeout(void* parg)
 {
 #ifdef WIN32
@@ -786,7 +793,8 @@ bool AppInit2(boost::thread_group& threadGroup)
     {
         uiInterface.InitMessage(_("Starting NTP sync thread..."));
         printf("Starting NTP sync thread...\n");
-        threadGroup.create_thread(boost::bind(threadNTPUpdate, mapArgs["-ntpserver"]));
+        // The pool name lives as long as the thread, which may outlast this scope.
+        StartCoreThread("ntp", ThreadNTPUpdateEntry, new std::string(mapArgs["-ntpserver"]));
     }
 
     // ********************************************************* Step 8: load blockchain
@@ -1029,11 +1037,11 @@ bool AppInit2(boost::thread_group& threadGroup)
     printf("mapWallet.size() = %" PRIszu "\n",       pwalletMain->mapWallet.size());
     printf("mapAddressBook.size() = %" PRIszu "\n",  pwalletMain->mapAddressBook.size());
 
-    if (!NewThread(StartNode, NULL))
+    if (!StartCoreThread("net-start", StartNode, NULL))
         InitError(_("Error: could not start node"));
 
     if (fServer)
-        NewThread(ThreadRPCServer, NULL);
+        StartCoreThread("rpc-listener", ThreadRPCServer, NULL);
 
     // ********************************************************* Step 13: finished
 

@@ -1414,11 +1414,16 @@ void InitCoreThreads()
 }
 
 // Join and drop threads that have already returned. Caller holds the mutex.
+// The calling thread may itself be registered (StartNode starts the network
+// threads), and a thread can't join itself, so it is skipped.
 void PruneCoreThreads()
 {
+    const boost::thread::id self = boost::this_thread::get_id();
     for (std::list<CCoreThread>::iterator it = plistCoreThreads->begin(); it != plistCoreThreads->end(); )
     {
-        if (!it->pthread->joinable() || it->pthread->try_join_for(boost::chrono::milliseconds(0)))
+        if (it->pthread->get_id() == self)
+            ++it;
+        else if (!it->pthread->joinable() || it->pthread->try_join_for(boost::chrono::milliseconds(0)))
             it = plistCoreThreads->erase(it);
         else
             ++it;
@@ -1466,8 +1471,11 @@ bool JoinCoreThreads(int64_t nTimeoutMillis, std::vector<std::string>& vStraggle
     const boost::chrono::steady_clock::time_point deadline =
         boost::chrono::steady_clock::now() + boost::chrono::milliseconds(nTimeoutMillis);
     std::vector<boost::thread*> vJoined;
+    const boost::thread::id self = boost::this_thread::get_id();
     BOOST_FOREACH(const CCoreThread& thread, vSnapshot)
     {
+        if (thread.pthread->get_id() == self)
+            continue; // a registered caller can't join itself; it stays registered
         if (!thread.pthread->joinable() || thread.pthread->try_join_until(deadline))
         {
             printf("%s stopped\n", thread.strName.c_str());
