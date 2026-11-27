@@ -23,10 +23,15 @@
 #include <QLocale>
 #include <QTranslator>
 #include <QSplashScreen>
+#include <QTimer>
 #include <QLibraryInfo>
 #include <QDesktopWidget>
 #include <QFontDatabase>
 #include <QScreen>
+#include <QSemaphore>
+#include <QThread>
+
+#include <memory>
 
 #ifdef Q_OS_MAC
 #include "macdockiconhandler.h"
@@ -47,20 +52,56 @@ Q_IMPORT_PLUGIN(qtaccessiblewidgets)
 static BitcoinGUI *guiref;
 static QSplashScreen *splashref;
 
+// Runs fn on the GUI thread and waits for it to finish. A core thread stops waiting
+// once shutdown has started (fShutdown): the shutdown joins it, and the GUI thread
+// may never run a queued call again because its event loop has ended. A call that
+// has not started by then is dropped. Returns false if the wait ended before fn
+// finished.
+template <typename Fn>
+static bool RunOnGUIThread(BitcoinGUI* gui, Fn fn)
+{
+    if (QThread::currentThread() == gui->thread())
+    {
+        fn();
+        return true;
+    }
+    std::shared_ptr<QSemaphore> done = std::make_shared<QSemaphore>(0);
+    QMetaObject::invokeMethod(gui, [fn, done]() {
+        if (!fShutdown)
+            fn();
+        done->release();
+    }, Qt::QueuedConnection);
+    while (!done->tryAcquire(1, 100))
+    {
+        if (fShutdown)
+            return done->tryAcquire();
+    }
+    return true;
+}
+
 static void ThreadSafeMessageBox(const std::string& message, const std::string& caption, int style)
 {
     // Message from network thread
-    if(guiref)
+    BitcoinGUI* gui = guiref;
+    bool fShown = false;
+    if (gui)
     {
         bool modal = (style & CClientUIInterface::MODAL);
-        // in case of modal message, use blocking connection to wait for user to click OK
-        QMetaObject::invokeMethod(guiref, "error",
-                                   modal ? GUIUtil::blockingGUIThreadConnection() : Qt::QueuedConnection,
-                                   Q_ARG(QString, QString::fromStdString(caption)),
-                                   Q_ARG(QString, QString::fromStdString(message)),
-                                   Q_ARG(bool, modal));
+        QString qCaption = QString::fromStdString(caption);
+        QString qMessage = QString::fromStdString(message);
+        if (modal)
+        {
+            // Wait for the user to click OK.
+            fShown = RunOnGUIThread(gui, [gui, qCaption, qMessage]() { gui->error(qCaption, qMessage, true); });
+        }
+        else
+        {
+            QMetaObject::invokeMethod(gui, "error", Qt::QueuedConnection,
+                                      Q_ARG(QString, qCaption), Q_ARG(QString, qMessage), Q_ARG(bool, false));
+            fShown = true;
+        }
     }
-    else
+    if (!fShown)
     {
         printf("%s: %s\n", caption.c_str(), message.c_str());
         fprintf(stderr, "%s: %s\n", caption.c_str(), message.c_str());
@@ -69,17 +110,17 @@ static void ThreadSafeMessageBox(const std::string& message, const std::string& 
 
 static bool ThreadSafeAskFee(int64_t nFeeRequired, const std::string& strCaption)
 {
-    if(!guiref)
+    BitcoinGUI* gui = guiref;
+    if(!gui)
         return false;
     if(nFeeRequired < MIN_TX_FEE || nFeeRequired <= nTransactionFee || fDaemon)
         return true;
-    bool payFee = false;
 
-    QMetaObject::invokeMethod(guiref, "askFee", GUIUtil::blockingGUIThreadConnection(),
-                               Q_ARG(qint64, nFeeRequired),
-                               Q_ARG(bool*, &payFee));
-
-    return payFee;
+    // Shared with the GUI call, which may still finish after a wait that shutdown ended.
+    std::shared_ptr<bool> payFee = std::make_shared<bool>(false);
+    if (!RunOnGUIThread(gui, [gui, nFeeRequired, payFee]() { gui->askFee(nFeeRequired, payFee.get()); }))
+        return false;
+    return *payFee;
 }
 
 static void ThreadSafeHandleURI(const std::string& strURI)
@@ -123,6 +164,52 @@ static void handleRunawayException(std::exception *e)
     QMessageBox::critical(0, "Runaway exception", BitcoinGUI::tr("A fatal error occurred. Pinkcoin can no longer continue safely and will quit.") + QString("\n\n") + QString::fromStdString(strMiscWarning));
     exit(1);
 }
+
+// Stops the RPC console executor, which runs RPC commands against the wallet, and then
+// the core threads; they share the shutdown deadline. Used after init, and when init
+// fails or stops: the executor starts with the window. Returns false if anything did
+// not stop in time.
+static bool StopConsoleAndCoreThreads(BitcoinGUI& window)
+{
+    int64_t nStart = GetTimeMillis();
+    bool fConsoleStopped = window.shutdownRPCConsole(SHUTDOWN_JOIN_TIMEOUT_MS);
+#ifdef PINK2_SHUTDOWN_TEST_HOOKS
+    // Test builds only: behave as if a console command had used up the whole
+    // deadline, to exercise the GUI's forced shutdown path.
+    if (GetBoolArg("-shutdownconsolestucktest"))
+    {
+        fConsoleStopped = false;
+        nStart -= SHUTDOWN_JOIN_TIMEOUT_MS;
+    }
+#endif
+    if (!fConsoleStopped)
+        printf("Shutdown: rpcconsole-executor did not stop within %d s\n", (int)(SHUTDOWN_JOIN_TIMEOUT_MS / 1000));
+    // Give the core threads at least a few seconds even if the console used
+    // up the deadline: most stop within a second, and each one that stops is
+    // one fewer running through the forced path.
+    static const int64_t SHUTDOWN_MIN_JOIN_MS = 5000;
+    int64_t nLeft = std::max<int64_t>(SHUTDOWN_MIN_JOIN_MS, SHUTDOWN_JOIN_TIMEOUT_MS - (GetTimeMillis() - nStart));
+    return ShutdownStopThreads(nLeft) && fConsoleStopped;
+}
+
+#ifdef PINK2_SHUTDOWN_TEST_HOOKS
+// Test builds only (-shutdownguicalltest): a registered thread makes a modal GUI call
+// after the event loop has ended and before the GUI stops taking such calls, so the
+// call is queued and never run.
+static std::atomic<bool> fGuiCallTestGo(false);
+static std::atomic<bool> fGuiCallTestCalling(false);
+
+static void ThreadGuiCallTest(void* parg)
+{
+    while (!fGuiCallTestGo && !fShutdown)
+        MilliSleep(10);
+    if (fShutdown)
+        return;
+    fGuiCallTestCalling = true;
+    uiInterface.ThreadSafeMessageBox("Shutdown GUI call test", "Pinkcoin", CClientUIInterface::OK | CClientUIInterface::MODAL);
+    printf("test-guicall: the GUI call returned\n");
+}
+#endif
 
 #ifndef BITCOIN_QT_TEST
 int main(int argc, char *argv[])
@@ -283,37 +370,43 @@ int main(int argc, char *argv[])
                 // Place this here as guiref has to be defined if we don't want to lose URIs
                 ipcInit(argc, argv);
 
-                app.exec();
+                // A shutdown can be requested before the event loop runs (an RPC stop or
+                // a signal during startup), and a queued quit() handled outside exec() is
+                // lost. So poll the request: skip exec() if it is already set, and quit as
+                // soon as it is set while exec() or a nested event loop runs.
+                QTimer pollShutdownTimer;
+                QObject::connect(&pollShutdownTimer, &QTimer::timeout, [&app]() {
+                    if (fRequestShutdown)
+                        app.quit();
+                });
+#ifdef PINK2_SHUTDOWN_TEST_HOOKS
+                if (GetBoolArg("-shutdownguicalltest"))
+                    StartCoreThread("test-guicall", ThreadGuiCallTest, NULL);
+#endif
+                pollShutdownTimer.start(200);
+                if (!fRequestShutdown)
+                    app.exec();
+                pollShutdownTimer.stop();
+#ifdef PINK2_SHUTDOWN_TEST_HOOKS
+                if (GetBoolArg("-shutdownguicalltest"))
+                {
+                    fGuiCallTestGo = true;
+                    for (int i = 0; i < 200 && !fGuiCallTestCalling; i++)
+                        MilliSleep(10);
+                    MilliSleep(500); // the call is queued by now
+                }
+#endif
 
                 // From here core threads' GUI calls (message boxes, fee prompts, URIs)
-                // return at once instead of blocking against this thread.
+                // return at once, and a call already waiting for this thread stops
+                // waiting when the shutdown below starts.
                 guiref = 0;
                 window.hide();
                 window.setClientModel(0);
                 window.setWalletModel(0, 0);
                 window.setMessageModel(0);
 
-                // The RPC console executor runs RPC commands against the wallet: stop
-                // it first. It shares the shutdown deadline with the core threads.
-                int64_t nStart = GetTimeMillis();
-                bool fConsoleStopped = window.shutdownRPCConsole(SHUTDOWN_JOIN_TIMEOUT_MS);
-#ifdef PINK2_SHUTDOWN_TEST_HOOKS
-                // Test builds only: behave as if a console command had used up the whole
-                // deadline, to exercise the GUI's forced shutdown path.
-                if (GetBoolArg("-shutdownconsolestucktest"))
-                {
-                    fConsoleStopped = false;
-                    nStart -= SHUTDOWN_JOIN_TIMEOUT_MS;
-                }
-#endif
-                if (!fConsoleStopped)
-                    printf("Shutdown: rpcconsole-executor did not stop within %d s\n", (int)(SHUTDOWN_JOIN_TIMEOUT_MS / 1000));
-                // Give the core threads at least a few seconds even if the console used
-                // up the deadline: most stop within a second, and each one that stops is
-                // one fewer running through the forced path.
-                static const int64_t SHUTDOWN_MIN_JOIN_MS = 5000;
-                int64_t nLeft = std::max<int64_t>(SHUTDOWN_MIN_JOIN_MS, SHUTDOWN_JOIN_TIMEOUT_MS - (GetTimeMillis() - nStart));
-                fClean = ShutdownStopThreads(nLeft) && fConsoleStopped;
+                fClean = StopConsoleAndCoreThreads(window);
 
                 // Forced path: a thread may still call into the models, so leave from
                 // here, before they are destroyed. ShutdownFinish(false) does not return.
@@ -327,12 +420,14 @@ int main(int argc, char *argv[])
         }
         else
         {
-            // Init may have started the node and RPC threads before it failed.
+            // Init may have started the node and RPC threads before it failed, or
+            // stopped because a shutdown was requested, which is not a failure.
+            bool fShutdownRequested = fRequestShutdown;
             guiref = 0;
-            Shutdown(NULL);
+            ShutdownFinish(StopConsoleAndCoreThreads(window));
             threadGroup.interrupt_all();
             threadGroup.join_all();
-            return 1;
+            return fShutdownRequested ? 0 : 1;
         }
     } catch (std::exception& e) {
         handleRunawayException(&e);
