@@ -171,6 +171,9 @@ static void handleRunawayException(std::exception *e)
 // not stop in time.
 static bool StopConsoleAndCoreThreads(BitcoinGUI& window)
 {
+    // Before anything that can block, the log line below included. The watchdog
+    // stays armed until the console executor and the core threads have stopped.
+    ArmShutdownWatchdog(SHUTDOWN_JOIN_TIMEOUT_MS + SHUTDOWN_FORCED_FLUSH_TIMEOUT_MS);
     int64_t nStart = GetTimeMillis();
     bool fConsoleStopped = window.shutdownRPCConsole(SHUTDOWN_JOIN_TIMEOUT_MS);
 #ifdef PINK2_SHUTDOWN_TEST_HOOKS
@@ -189,7 +192,7 @@ static bool StopConsoleAndCoreThreads(BitcoinGUI& window)
     // one fewer running through the forced path.
     static const int64_t SHUTDOWN_MIN_JOIN_MS = 5000;
     int64_t nLeft = std::max<int64_t>(SHUTDOWN_MIN_JOIN_MS, SHUTDOWN_JOIN_TIMEOUT_MS - (GetTimeMillis() - nStart));
-    return ShutdownStopThreads(nLeft) && fConsoleStopped;
+    return ShutdownStopThreads(nLeft, fConsoleStopped) && fConsoleStopped;
 }
 
 #ifdef PINK2_SHUTDOWN_TEST_HOOKS
@@ -387,6 +390,8 @@ int main(int argc, char *argv[])
                 if (!fRequestShutdown)
                     app.exec();
                 pollShutdownTimer.stop();
+                // Shutdown starts here: bound it before the window is taken down.
+                ArmShutdownWatchdog(SHUTDOWN_JOIN_TIMEOUT_MS + SHUTDOWN_FORCED_FLUSH_TIMEOUT_MS);
 #ifdef PINK2_SHUTDOWN_TEST_HOOKS
                 if (GetBoolArg("-shutdownguicalltest"))
                 {

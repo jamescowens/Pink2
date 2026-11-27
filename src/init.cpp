@@ -24,6 +24,9 @@
 
 #ifndef WIN32
 #include <signal.h>
+#include <unistd.h>
+#else
+#include <io.h>
 #endif
 
 
@@ -77,6 +80,22 @@ static void ThreadShutdownStragglerLockTest(void* parg)
     LOCK(bitdb.cs_db);
     MilliSleep(120000);
 }
+
+// Test builds only: a registered thread that, once a stop is requested, keeps
+// writing to debug.log and ignores fShutdown. When debug.log is a pipe that is not
+// being read, its write blocks while it holds the debug log's lock. It starts
+// writing at once, so its write blocks before shutdown writes its first line.
+static void ThreadShutdownLogLockTest(void* parg)
+{
+    while (!fRequestShutdown)
+        MilliSleep(10);
+    for (unsigned int n = 0; ; n++)
+    {
+        printf("test-loglock %u: written after the shutdown request\n", n);
+        if (n >= 2000)
+            MilliSleep(1);
+    }
+}
 #endif
 
 void ExitTimeout(void* parg)
@@ -101,13 +120,98 @@ void StartShutdown()
 
 static int64_t nShutdownStartMillis = 0;
 
-bool ShutdownStopThreads(int64_t nTimeoutMillis)
+// A thread that did not stop may hold a lock that shutdown needs, the debug log's
+// among them, so shutdown's own log lines can block as well as its flushes. A
+// watchdog, armed before shutdown writes anything, ends the process with status 1
+// unless every thread is joined within the deadline, or the forced path's flush
+// finishes within 10 s of starting. Its state is allocated once and never freed,
+// like the debug log's lock.
+static boost::mutex* const pmutexShutdownWatchdog = new boost::mutex();
+static boost::condition_variable* const pcondShutdownWatchdog = new boost::condition_variable();
+static boost::thread* pthreadShutdownWatchdog = NULL;
+static boost::chrono::steady_clock::time_point tpShutdownWatchdog;
+static bool fShutdownWatchdogDisarmed = false;
+
+// Writes the watchdog's message to stderr with write(), which takes no stdio lock.
+// The debug log's own lock may be the one that is held, so it is not used.
+static void ThreadShutdownWatchdogMessage()
+{
+    static const char msg[] = "Shutdown: did not finish in time; exiting with status 1\n";
+#ifdef WIN32
+    int nWritten = _write(2, msg, sizeof(msg) - 1);
+#else
+    ssize_t nWritten = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+    (void)nWritten;
+}
+
+static void ThreadShutdownWatchdog()
+{
+    boost::unique_lock<boost::mutex> lock(*pmutexShutdownWatchdog);
+    while (!fShutdownWatchdogDisarmed && boost::chrono::steady_clock::now() < tpShutdownWatchdog)
+        pcondShutdownWatchdog->wait_until(lock, tpShutdownWatchdog);
+    if (fShutdownWatchdogDisarmed)
+        return;
+    // The message is best effort, and the exit does not wait for it: stderr may
+    // block, or another thread may hold its stdio lock.
+    try
+    {
+        boost::thread threadMessage(ThreadShutdownWatchdogMessage);
+        threadMessage.try_join_for(boost::chrono::milliseconds(100));
+        std::_Exit(1);
+    }
+    catch (...)
+    {
+    }
+    std::_Exit(1);
+}
+
+void ArmShutdownWatchdog(int64_t nMillis)
+{
+    const boost::chrono::steady_clock::time_point tp =
+        boost::chrono::steady_clock::now() + boost::chrono::milliseconds(nMillis);
+    boost::unique_lock<boost::mutex> lock(*pmutexShutdownWatchdog);
+    if (pthreadShutdownWatchdog && !fShutdownWatchdogDisarmed)
+    {
+        if (tp > tpShutdownWatchdog)
+        {
+            tpShutdownWatchdog = tp;
+            pcondShutdownWatchdog->notify_all();
+        }
+        return;
+    }
+    // A watchdog disarmed earlier has been joined; like the mutex, its object is
+    // never freed, so no caller can be left holding a deleted one.
+    fShutdownWatchdogDisarmed = false;
+    tpShutdownWatchdog = tp;
+    pthreadShutdownWatchdog = new boost::thread(ThreadShutdownWatchdog);
+}
+
+// Stops the watchdog and joins it, so it does not outlive a clean shutdown.
+static void DisarmShutdownWatchdog()
+{
+    boost::thread* pthread;
+    {
+        boost::unique_lock<boost::mutex> lock(*pmutexShutdownWatchdog);
+        if (!pthreadShutdownWatchdog || fShutdownWatchdogDisarmed)
+            return;
+        fShutdownWatchdogDisarmed = true;
+        pcondShutdownWatchdog->notify_all();
+        pthread = pthreadShutdownWatchdog;
+    }
+    pthread->join();
+}
+
+bool ShutdownStopThreads(int64_t nTimeoutMillis, bool fCallerStopped)
 {
     static bool fDone = false;
     static bool fResult = true;
     if (fDone)
         return fResult;
     fDone = true;
+
+    // Before anything that can block, the log lines below included.
+    ArmShutdownWatchdog(nTimeoutMillis + SHUTDOWN_FORCED_FLUSH_TIMEOUT_MS);
 
     // The calling thread is not renamed: in the daemon it is the main thread, and
     // scripts that wait for the process name to disappear must not see it vanish
@@ -134,6 +238,8 @@ bool ShutdownStopThreads(int64_t nTimeoutMillis)
     fResult = JoinCoreThreads(nTimeoutMillis, vStragglers);
     if (fResult)
     {
+        if (fCallerStopped)
+            DisarmShutdownWatchdog();
         if (fInitDataDirLocked)
             printf("Shutdown: all %d threads stopped in %d ms\n", (int)nThreads, (int)(GetTimeMillis() - nShutdownStartMillis));
     }
@@ -145,12 +251,27 @@ bool ShutdownStopThreads(int64_t nTimeoutMillis)
     return fResult;
 }
 
+static void RemovePidFile()
+{
+    boost::system::error_code ec;
+    boost::filesystem::remove(GetPidFile(), ec);
+    if (ec)
+        printf("Shutdown: could not remove the pid file: %s\n", ec.message().c_str());
+}
+
 void ShutdownFinish(bool fClean)
 {
     static bool fDone = false;
     if (fDone)
         return;
     fDone = true;
+
+    if (!fClean)
+    {
+        // The flush gets its full time even when the threads used the whole deadline.
+        ArmShutdownWatchdog(SHUTDOWN_FORCED_FLUSH_TIMEOUT_MS);
+        printf("Shutdown: flushing; bounded to %d s\n", (int)(SHUTDOWN_FORCED_FLUSH_TIMEOUT_MS / 1000));
+    }
 
     if (fInitNodeStarted)
         DumpAddresses();
@@ -169,7 +290,7 @@ void ShutdownFinish(bool fClean)
         if (fInitDataDirLocked)
         {
             bitdb.Flush(true);
-            boost::filesystem::remove(GetPidFile());
+            RemovePidFile();
         }
         printf("Pinkcoin exited (forced)\n\n");
         fflush(stdout);
@@ -191,7 +312,7 @@ void ShutdownFinish(bool fClean)
     delete pstakeDB;
     pstakeDB = NULL;
     if (fInitDataDirLocked)
-        boost::filesystem::remove(GetPidFile());
+        RemovePidFile();
 #ifdef WIN32
     // Bound the rest of the teardown (Qt, static destructors) on Windows.
     NewThread(ExitTimeout, NULL);
@@ -1196,6 +1317,8 @@ bool AppInit2(boost::thread_group& threadGroup)
         StartCoreThread("test-straggler", ThreadShutdownStragglerTest, NULL);
     if (GetBoolArg("-shutdownstragglerlocktest"))
         StartCoreThread("test-straggler-lock", ThreadShutdownStragglerLockTest, NULL);
+    if (GetBoolArg("-shutdownloglocktest"))
+        StartCoreThread("test-loglock", ThreadShutdownLogLockTest, NULL);
 #endif
 
     // The daemon's main thread returns to AppInit(), which waits for a shutdown
