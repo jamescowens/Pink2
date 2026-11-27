@@ -783,7 +783,15 @@ public:
     virtual void shutdownSocket()
     {
 #ifdef WIN32
-        ::shutdown(sslStream.lowest_layer().native_handle(), SD_BOTH);
+        SOCKET s = sslStream.lowest_layer().native_handle();
+        ::shutdown(s, SD_BOTH);
+        // On Windows also cancel the socket's pending I/O. CancelIoEx is looked
+        // up at run time (Vista and later).
+        typedef BOOL (WINAPI *CancelIoExFn)(HANDLE, LPOVERLAPPED);
+        static CancelIoExFn pCancelIoEx = reinterpret_cast<CancelIoExFn>(
+            reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("kernel32.dll"), "CancelIoEx")));
+        if (pCancelIoEx)
+            pCancelIoEx(reinterpret_cast<HANDLE>(s), NULL);
 #else
         ::shutdown(sslStream.lowest_layer().native_handle(), SHUT_RDWR);
 #endif
