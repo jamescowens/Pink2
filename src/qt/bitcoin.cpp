@@ -15,6 +15,8 @@
 #include "qtipcserver.h"
 
 #include <QApplication>
+
+#include <algorithm>
 #include <QStyleFactory>
 #include <QMessageBox>
 #include <QTextCodec>
@@ -85,7 +87,9 @@ static void ThreadSafeHandleURI(const std::string& strURI)
     if(!guiref)
         return;
 
-    QMetaObject::invokeMethod(guiref, "handleURI", GUIUtil::blockingGUIThreadConnection(),
+    // Queued, not blocking: nothing needs the result, and a blocking call into the
+    // GUI thread while it joins the core threads at shutdown would deadlock.
+    QMetaObject::invokeMethod(guiref, "handleURI", Qt::QueuedConnection,
                                Q_ARG(QString, QString::fromStdString(strURI)));
 }
 
@@ -245,9 +249,12 @@ int main(int argc, char *argv[])
         guiref = &window;
         if(AppInit2(threadGroup))
         {
+            bool fClean = true;
             {
-                // Put this in a block, so that the Model objects are cleaned up before
-                // calling Shutdown().
+                // The models live in this block. The core threads are stopped and
+                // joined (ShutdownStopThreads) before the block ends, so none can call
+                // into a model while it is destroyed; the wallets are freed only after
+                // (ShutdownFinish), so the models' destructors still find them.
 
                 if (splashref)
                     splash.finish(&window);
@@ -278,19 +285,35 @@ int main(int argc, char *argv[])
 
                 app.exec();
 
+                // From here core threads' GUI calls (message boxes, fee prompts, URIs)
+                // return at once instead of blocking against this thread.
+                guiref = 0;
                 window.hide();
                 window.setClientModel(0);
                 window.setWalletModel(0, 0);
                 window.setMessageModel(0);
-                guiref = 0;
+
+                // The RPC console executor runs RPC commands against the wallet: stop
+                // it first. It shares the shutdown deadline with the core threads.
+                int64_t nStart = GetTimeMillis();
+                bool fConsoleStopped = window.shutdownRPCConsole(SHUTDOWN_JOIN_TIMEOUT_MS);
+                if (!fConsoleStopped)
+                    printf("Shutdown: rpcconsole-executor did not stop within %d s\n", (int)(SHUTDOWN_JOIN_TIMEOUT_MS / 1000));
+                int64_t nLeft = std::max<int64_t>(0, SHUTDOWN_JOIN_TIMEOUT_MS - (GetTimeMillis() - nStart));
+                fClean = ShutdownStopThreads(nLeft) && fConsoleStopped;
             }
-            // Shutdown the core and its threads, but don't exit Bitcoin-Qt here
-            Shutdown(NULL);
+            // Shutdown the core and free the wallets, but don't exit Bitcoin-Qt here
+            ShutdownFinish(fClean);
             threadGroup.interrupt_all();
             threadGroup.join_all();
         }
         else
         {
+            // Init may have started the node and RPC threads before it failed.
+            guiref = 0;
+            Shutdown(NULL);
+            threadGroup.interrupt_all();
+            threadGroup.join_all();
             return 1;
         }
     } catch (std::exception& e) {

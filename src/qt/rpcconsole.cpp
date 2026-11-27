@@ -191,7 +191,8 @@ void RPCExecutor::request(const QString &command)
 RPCConsole::RPCConsole(QWidget *parent) :
     QDialog(parent),
     ui(new Ui::RPCConsole),
-    historyPtr(0)
+    historyPtr(0),
+    executorThread(0)
 {
     ui->setupUi(this);
 
@@ -413,7 +414,20 @@ void RPCConsole::startExecutor()
 
     // Default implementation of QThread::run() simply spins up an event loop in the thread,
     // which is what we want.
+    executorThread = thread;
     thread->start();
+}
+
+bool RPCConsole::shutdownExecutor(unsigned long msTimeout)
+{
+    if (!executorThread)
+        return true;
+    // Quit the executor's event loop; a command already running finishes first.
+    emit stopExecutor();
+    if (!executorThread->wait(msTimeout))
+        return false;
+    executorThread = 0;
+    return true;
 }
 
 void RPCConsole::on_tabWidget_currentChanged(int index)
