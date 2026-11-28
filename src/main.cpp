@@ -2039,7 +2039,7 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
     if (!fIsInitialDownload && !strCmd.empty())
     {
         boost::replace_all(strCmd, "%s", hashBestChain.GetHex());
-        boost::thread t(runCommand, strCmd); // thread runs free
+        StartNotifyCommand(strCmd);
     }
 
     return true;
@@ -2787,6 +2787,10 @@ bool LoadBlockIndex(bool fAllowNew)
     if (!txdb.LoadBlockIndex())
         return false;
 
+    // Stop here if a shutdown was requested during the load; the caller ends init.
+    if (fRequestShutdown)
+        return true;
+
     //
     // Init with genesis block
     //
@@ -2794,6 +2798,10 @@ bool LoadBlockIndex(bool fAllowNew)
     {
         if (!fAllowNew)
             return false;
+
+        uint256 hashBestStored;
+        if (txdb.ReadHashBestChain(hashBestStored))
+            return error("LoadBlockIndex() : block index database is inconsistent");
 
         // Genesis block
 

@@ -14,6 +14,7 @@
 #include <sys/resource.h>
 #endif
 
+#include <atomic>
 #include <map>
 #include <list>
 #include <utility>
@@ -127,8 +128,8 @@ extern bool fDebugSmsg;
 extern bool fSmsg;
 extern bool fPrintToConsole;
 extern bool fPrintToDebugger;
-extern bool fRequestShutdown;
-extern bool fShutdown;
+extern std::atomic<bool> fRequestShutdown;
+extern std::atomic<bool> fShutdown;
 extern bool fDaemon;
 extern bool fServer;
 extern bool fCommandLine;
@@ -215,6 +216,7 @@ std::string FormatSubVersion(const std::string& name, int nClientVersion, const 
 void CompareTimeWithPeers(const std::vector<int64_t>& vSorted);
 void AddTimeData(const CNetAddr& ip, int64_t nTime, bool fSyncTime = false);
 void runCommand(std::string strCommand);
+void StartNotifyCommand(const std::string& strCommand);
 
 
 
@@ -604,6 +606,22 @@ public:
 };
 
 bool NewThread(void(*pfn)(void*), void* parg);
+
+/** Start a joinable core thread and keep it in the core-thread registry, so that
+ *  shutdown can join it before anything it uses is destroyed. Returns false, and
+ *  starts nothing, once fShutdown is set or if the thread can't be created.
+ *  Threads that have already finished are joined and dropped on every call. */
+bool StartCoreThread(const char* pszName, void(*pfn)(void*), void* parg);
+/** Join every registered core thread against one deadline nTimeoutMillis from
+ *  now, logging "<name> stopped" for each. Returns true if all stopped; the
+ *  names of those that didn't are put in vStragglers, and they stay registered.
+ *  Call only after fShutdown is set. */
+bool JoinCoreThreads(int64_t nTimeoutMillis, std::vector<std::string>& vStragglers);
+/** Number of registered core threads that haven't been joined yet. */
+size_t CoreThreadCount();
+/** Sleep for nMillis in steps of at most 100 ms. Returns false as soon as
+ *  fShutdown is set, true if the whole time passed. */
+bool ShutdownSleep(int64_t nMillis);
 
 #ifdef WIN32
 inline void SetThreadPriority(int nPriority)

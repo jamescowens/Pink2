@@ -27,6 +27,11 @@ namespace boost {
 #include <boost/filesystem/fstream.hpp>
 #include <boost/foreach.hpp>
 #include <boost/thread.hpp>
+#include <boost/chrono.hpp>
+#include <boost/shared_ptr.hpp>
+#include <algorithm>
+#include <memory>
+#include <mutex>
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
 #include <stdarg.h>
@@ -66,8 +71,8 @@ bool fDebugSmsg = false;
 bool fSmsg = false;
 bool fPrintToConsole = false;
 bool fPrintToDebugger = false;
-bool fRequestShutdown = false;
-bool fShutdown = false;
+std::atomic<bool> fRequestShutdown(false);
+std::atomic<bool> fShutdown(false);
 bool fDaemon = false;
 bool fServer = false;
 bool fCommandLine = false;
@@ -1358,6 +1363,24 @@ void runCommand(std::string strCommand)
         printf("runCommand error: system(%s) returned %d\n", strCommand.c_str(), nErr);
 }
 
+// Thread entry for a notification command; parg is a heap std::string.
+static void ThreadNotifyCommand(void* parg)
+{
+    std::unique_ptr<std::string> pstrCommand(static_cast<std::string*>(parg));
+    runCommand(*pstrCommand);
+}
+
+// Runs a -walletnotify, -blocknotify or -alertnotify command on its own thread.
+// The thread is registered, so shutdown joins a command that is still running
+// with every other thread, against the same deadline. Once shutdown has begun,
+// no new command starts.
+void StartNotifyCommand(const std::string& strCommand)
+{
+    std::string* pstrCommand = new std::string(strCommand);
+    if (!StartCoreThread("notify", ThreadNotifyCommand, pstrCommand))
+        delete pstrCommand;
+}
+
 void RenameThread(const char* name)
 {
 #if defined(PR_SET_NAME)
@@ -1387,4 +1410,131 @@ bool NewThread(void(*pfn)(void*), void* parg)
         return false;
     }
     return true;
+}
+
+namespace {
+
+struct CCoreThread
+{
+    std::string strName;
+    boost::shared_ptr<boost::thread> pthread;
+};
+
+// Allocated on first use and never freed: static teardown must not destroy the
+// registry under a thread that still uses it (same reason as mutexDebugLog).
+boost::mutex* pmutexCoreThreads = NULL;
+std::list<CCoreThread>* plistCoreThreads = NULL;
+std::once_flag coreThreadsInitFlag;
+
+void InitCoreThreads()
+{
+    pmutexCoreThreads = new boost::mutex();
+    plistCoreThreads = new std::list<CCoreThread>();
+}
+
+// Join and drop threads that have already returned. Caller holds the mutex.
+// The calling thread may itself be registered (StartNode starts the network
+// threads), and a thread can't join itself, so it is skipped.
+void PruneCoreThreads()
+{
+    const boost::thread::id self = boost::this_thread::get_id();
+    for (std::list<CCoreThread>::iterator it = plistCoreThreads->begin(); it != plistCoreThreads->end(); )
+    {
+        if (it->pthread->get_id() == self)
+            ++it;
+        else if (!it->pthread->joinable() || it->pthread->try_join_for(boost::chrono::milliseconds(0)))
+            it = plistCoreThreads->erase(it);
+        else
+            ++it;
+    }
+}
+
+}
+
+bool StartCoreThread(const char* pszName, void(*pfn)(void*), void* parg)
+{
+    std::call_once(coreThreadsInitFlag, InitCoreThreads);
+    boost::mutex::scoped_lock lock(*pmutexCoreThreads);
+    if (fShutdown)
+    {
+        printf("StartCoreThread(%s) refused: shutting down\n", pszName);
+        return false;
+    }
+    PruneCoreThreads();
+    try
+    {
+        CCoreThread thread;
+        thread.strName = pszName;
+        thread.pthread.reset(new boost::thread(pfn, parg));
+        plistCoreThreads->push_back(thread);
+    } catch(boost::thread_resource_error &e) {
+        printf("Error creating thread %s: %s\n", pszName, e.what());
+        return false;
+    }
+    return true;
+}
+
+bool JoinCoreThreads(int64_t nTimeoutMillis, std::vector<std::string>& vStragglers)
+{
+    std::call_once(coreThreadsInitFlag, InitCoreThreads);
+    vStragglers.clear();
+
+    // Join from a snapshot, without holding the mutex: a thread being joined may
+    // still call StartCoreThread (which refuses once fShutdown is set).
+    std::vector<CCoreThread> vSnapshot;
+    {
+        boost::mutex::scoped_lock lock(*pmutexCoreThreads);
+        vSnapshot.assign(plistCoreThreads->begin(), plistCoreThreads->end());
+    }
+
+    const boost::chrono::steady_clock::time_point deadline =
+        boost::chrono::steady_clock::now() + boost::chrono::milliseconds(nTimeoutMillis);
+    std::vector<boost::thread*> vJoined;
+    const boost::thread::id self = boost::this_thread::get_id();
+    BOOST_FOREACH(const CCoreThread& thread, vSnapshot)
+    {
+        if (thread.pthread->get_id() == self)
+            continue; // a registered caller can't join itself; it stays registered
+        if (!thread.pthread->joinable() || thread.pthread->try_join_until(deadline))
+        {
+            printf("%s stopped\n", thread.strName.c_str());
+            vJoined.push_back(thread.pthread.get());
+        }
+        else
+            vStragglers.push_back(thread.strName);
+    }
+
+    {
+        boost::mutex::scoped_lock lock(*pmutexCoreThreads);
+        for (std::list<CCoreThread>::iterator it = plistCoreThreads->begin(); it != plistCoreThreads->end(); )
+        {
+            if (std::find(vJoined.begin(), vJoined.end(), it->pthread.get()) != vJoined.end())
+                it = plistCoreThreads->erase(it);
+            else
+                ++it;
+        }
+    }
+    return vStragglers.empty();
+}
+
+size_t CoreThreadCount()
+{
+    std::call_once(coreThreadsInitFlag, InitCoreThreads);
+    boost::mutex::scoped_lock lock(*pmutexCoreThreads);
+    return plistCoreThreads->size();
+}
+
+bool ShutdownSleep(int64_t nMillis)
+{
+    const boost::chrono::steady_clock::time_point end =
+        boost::chrono::steady_clock::now() + boost::chrono::milliseconds(nMillis);
+    while (!fShutdown)
+    {
+        boost::chrono::steady_clock::time_point now = boost::chrono::steady_clock::now();
+        if (now >= end)
+            return true;
+        int64_t nLeft = boost::chrono::duration_cast<boost::chrono::milliseconds>(end - now).count();
+        MilliSleep(std::min<int64_t>(nLeft, 100));
+    }
+    return false;
 }

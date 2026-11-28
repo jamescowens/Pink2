@@ -7,6 +7,7 @@ namespace Ui {
     class RPCConsole;
 }
 class ClientModel;
+class QThread;
 
 /** Local Bitcoin RPC console. */
 class RPCConsole: public QDialog
@@ -45,6 +46,11 @@ private slots:
     /** update traffic statistics */
     void updateTrafficStats(quint64 totalBytesIn, quint64 totalBytesOut);
 
+public:
+    /** Stop the RPC command executor thread and wait up to msTimeout for it.
+     *  Returns false if a command is still running when the time is up. */
+    bool shutdownExecutor(unsigned long msTimeout);
+
 public slots:
     void clear();
     void message(int category, const QString &message, bool html = false);
@@ -68,6 +74,7 @@ private:
     ClientModel *clientModel;
     QStringList history;
     int historyPtr;
+    QThread *executorThread;
 
     void startExecutor();
 };

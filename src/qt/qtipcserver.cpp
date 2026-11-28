@@ -150,7 +150,7 @@ void ipcInit(int argc, char *argv[])
         return;
     }
 
-    if (!NewThread(ipcThread, mq))
+    if (!StartCoreThread("qt-ipc", ipcThread, mq))
     {
         delete mq;
         return;

@@ -1432,8 +1432,15 @@ void ThreadCleanWalletPassphrase(void* parg)
                 break;
 
             LEAVE_CRITICAL_SECTION(cs_nWalletUnlockTime);
-            MilliSleep(nToSleep);
+            bool fSlept = ShutdownSleep(nToSleep);
             ENTER_CRITICAL_SECTION(cs_nWalletUnlockTime);
+            if (!fSlept)
+            {
+                // Shutting down: the wallet is about to be freed, so leave it alone.
+                LEAVE_CRITICAL_SECTION(cs_nWalletUnlockTime);
+                delete (int64_t*)parg;
+                return;
+            }
 
         } while(1);
 
@@ -1490,9 +1497,9 @@ Value walletpassphrase(const Array& params, bool fHelp)
             "walletpassphrase <passphrase> <timeout>\n"
             "Stores the wallet decryption key in memory for <timeout> seconds.");
 
-    NewThread(ThreadTopUpKeyPool, NULL);
+    StartCoreThread("wallet-topup", ThreadTopUpKeyPool, NULL);
     int64_t* pnSleepTime = new int64_t(nSleepTime);
-    NewThread(ThreadCleanWalletPassphrase, pnSleepTime);
+    StartCoreThread("wallet-relock", ThreadCleanWalletPassphrase, pnSleepTime);
 
     // ppcoin: if user OS account compromised prevent trivial sendmoney commands
     if (params.size() > 2)

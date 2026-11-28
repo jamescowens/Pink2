@@ -170,6 +170,13 @@ private:
     QPoint mDiffWindowPosition;
     bool mMoving;
 
+public:
+    /** Stop the RPC console's command executor before the core shuts down; see
+     *  RPCConsole::shutdownExecutor. */
+    bool shutdownRPCConsole(unsigned long msTimeout);
+    /** Shutdown: stop the overview page's price updates. */
+    void stopPriceUpdates();
+
 public slots:
     /** Set number of connections shown in the UI */
     void setNumConnections(int count);

@@ -17,11 +17,16 @@
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
 #include <boost/interprocess/sync/file_lock.hpp>
+#include <boost/algorithm/string/join.hpp>
 #include <boost/algorithm/string/predicate.hpp>
 #include <openssl/crypto.h>
+#include <cstdlib>
 
 #ifndef WIN32
 #include <signal.h>
+#include <unistd.h>
+#else
+#include <io.h>
 #endif
 
 
@@ -38,10 +43,60 @@ unsigned int nDerivationMethodIndex;
 bool fUseFastIndex;
 enum Checkpoints::CPMode CheckpointsMode;
 
+// Init stages reached, so Shutdown() undoes only what was done. In particular an
+// instance that failed to lock the data directory must not touch it: another
+// instance owns it.
+static bool fInitDataDirLocked = false;   // the lock step passed (a forked child inherits this)
+static bool fInitBlockIndexLoaded = false;
+static bool fInitWalletLoaded = false;
+static bool fInitStakeDBLoaded = false;
+static bool fInitNodeStarted = false;
+#if !defined(QT_GUI)
+static bool fForkedParent = false;        // -daemon: this process is the parent that forked
+#endif
+
 //////////////////////////////////////////////////////////////////////////////
 //
 // Shutdown
 //
+
+// Thread entry for the NTP sync thread; parg is a heap std::string with the
+// pool name, kept for the life of the process.
+static void ThreadNTPUpdateEntry(void* parg)
+{
+    threadNTPUpdate(*static_cast<std::string*>(parg));
+}
+
+#ifdef PINK2_SHUTDOWN_TEST_HOOKS
+static void ThreadShutdownStragglerTest(void* parg)
+{
+    MilliSleep(60000);
+}
+
+// Test builds only: a registered thread that ignores fShutdown while it holds the wallet DB
+// environment's lock, so the forced path's flush cannot take it.
+static void ThreadShutdownStragglerLockTest(void* parg)
+{
+    LOCK(bitdb.cs_db);
+    MilliSleep(120000);
+}
+
+// Test builds only: a registered thread that, once a stop is requested, keeps
+// writing to debug.log and ignores fShutdown. When debug.log is a pipe that is not
+// being read, its write blocks while it holds the debug log's lock. It starts
+// writing at once, so its write blocks before shutdown writes its first line.
+static void ThreadShutdownLogLockTest(void* parg)
+{
+    while (!fRequestShutdown)
+        MilliSleep(10);
+    for (unsigned int n = 0; ; n++)
+    {
+        printf("test-loglock %u: written after the shutdown request\n", n);
+        if (n >= 2000)
+            MilliSleep(1);
+    }
+}
+#endif
 
 void ExitTimeout(void* parg)
 {
@@ -53,69 +108,222 @@ void ExitTimeout(void* parg)
 
 void StartShutdown()
 {
+    // One request flag for every build: the daemon's main thread waits for it in
+    // AppInit(), the GUI polls it, and init checks it between stages, so a request
+    // made at any time is acted on.
+    fRequestShutdown = true;
 #ifdef QT_GUI
     // ensure we leave the Qt main loop for a clean GUI exit (Shutdown() is called in bitcoin.cpp afterwards)
     uiInterface.QueueShutdown();
-#else
-    // Without UI, Shutdown() can simply be started in a new thread
-    NewThread(Shutdown, NULL);
 #endif
+}
+
+static int64_t nShutdownStartMillis = 0;
+
+// A thread that did not stop may hold a lock that shutdown needs, the debug log's
+// among them, so shutdown's own log lines can block as well as its flushes. A
+// watchdog, armed before shutdown writes anything, ends the process with status 1
+// unless every thread is joined within the deadline, or the forced path's flush
+// finishes within 10 s of starting. Its state is allocated once and never freed,
+// like the debug log's lock.
+static boost::mutex* const pmutexShutdownWatchdog = new boost::mutex();
+static boost::condition_variable* const pcondShutdownWatchdog = new boost::condition_variable();
+static boost::thread* pthreadShutdownWatchdog = NULL;
+static boost::chrono::steady_clock::time_point tpShutdownWatchdog;
+static bool fShutdownWatchdogDisarmed = false;
+
+// Writes the watchdog's message to stderr with write(), which takes no stdio lock.
+// The debug log's own lock may be the one that is held, so it is not used.
+static void ThreadShutdownWatchdogMessage()
+{
+    static const char msg[] = "Shutdown: did not finish in time; exiting with status 1\n";
+#ifdef WIN32
+    int nWritten = _write(2, msg, sizeof(msg) - 1);
+#else
+    ssize_t nWritten = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+    (void)nWritten;
+}
+
+static void ThreadShutdownWatchdog()
+{
+    boost::unique_lock<boost::mutex> lock(*pmutexShutdownWatchdog);
+    while (!fShutdownWatchdogDisarmed && boost::chrono::steady_clock::now() < tpShutdownWatchdog)
+        pcondShutdownWatchdog->wait_until(lock, tpShutdownWatchdog);
+    if (fShutdownWatchdogDisarmed)
+        return;
+    // The message is best effort, and the exit does not wait for it: stderr may
+    // block, or another thread may hold its stdio lock.
+    try
+    {
+        boost::thread threadMessage(ThreadShutdownWatchdogMessage);
+        threadMessage.try_join_for(boost::chrono::milliseconds(100));
+        std::_Exit(1);
+    }
+    catch (...)
+    {
+    }
+    std::_Exit(1);
+}
+
+void ArmShutdownWatchdog(int64_t nMillis)
+{
+    const boost::chrono::steady_clock::time_point tp =
+        boost::chrono::steady_clock::now() + boost::chrono::milliseconds(nMillis);
+    boost::unique_lock<boost::mutex> lock(*pmutexShutdownWatchdog);
+    if (pthreadShutdownWatchdog && !fShutdownWatchdogDisarmed)
+    {
+        if (tp > tpShutdownWatchdog)
+        {
+            tpShutdownWatchdog = tp;
+            pcondShutdownWatchdog->notify_all();
+        }
+        return;
+    }
+    // A watchdog disarmed earlier has been joined; like the mutex, its object is
+    // never freed, so no caller can be left holding a deleted one.
+    fShutdownWatchdogDisarmed = false;
+    tpShutdownWatchdog = tp;
+    pthreadShutdownWatchdog = new boost::thread(ThreadShutdownWatchdog);
+}
+
+// Stops the watchdog and joins it, so it does not outlive a clean shutdown.
+static void DisarmShutdownWatchdog()
+{
+    boost::thread* pthread;
+    {
+        boost::unique_lock<boost::mutex> lock(*pmutexShutdownWatchdog);
+        if (!pthreadShutdownWatchdog || fShutdownWatchdogDisarmed)
+            return;
+        fShutdownWatchdogDisarmed = true;
+        pcondShutdownWatchdog->notify_all();
+        pthread = pthreadShutdownWatchdog;
+    }
+    pthread->join();
+}
+
+bool ShutdownStopThreads(int64_t nTimeoutMillis, bool fCallerStopped)
+{
+    static bool fDone = false;
+    static bool fResult = true;
+    if (fDone)
+        return fResult;
+    fDone = true;
+
+    // Before anything that can block, the log lines below included.
+    ArmShutdownWatchdog(nTimeoutMillis + SHUTDOWN_FORCED_FLUSH_TIMEOUT_MS);
+
+    // The calling thread is not renamed: in the daemon it is the main thread, and
+    // scripts that wait for the process name to disappear must not see it vanish
+    // while shutdown is still flushing.
+    // A process that never locked the data directory started no threads, and its
+    // lines would land in the debug.log of the node that holds the lock.
+    if (fInitDataDirLocked)
+        printf("Shutdown: requested\n");
+    nShutdownStartMillis = GetTimeMillis();
+
+    fRequestShutdown = true;
+    fShutdown = true;
+    nTransactionsUpdated++;
+
+    // Wake the threads that a flag alone doesn't reach. StopNode() also logs, and
+    // an instance that never started the node has no connection threads to wake.
+    StopRPCThreads();
+    if (fInitNodeStarted)
+        StopNode();
+    SecureMsgSignalShutdown();
+
+    size_t nThreads = CoreThreadCount();
+    std::vector<std::string> vStragglers;
+    fResult = JoinCoreThreads(nTimeoutMillis, vStragglers);
+    if (fResult)
+    {
+        if (fCallerStopped)
+            DisarmShutdownWatchdog();
+        if (fInitDataDirLocked)
+            printf("Shutdown: all %d threads stopped in %d ms\n", (int)nThreads, (int)(GetTimeMillis() - nShutdownStartMillis));
+    }
+    else
+    {
+        printf("Shutdown: %d threads did not stop within %d s: %s\n", (int)vStragglers.size(),
+               (int)(nTimeoutMillis / 1000), boost::algorithm::join(vStragglers, ", ").c_str());
+    }
+    return fResult;
+}
+
+static void RemovePidFile()
+{
+    boost::system::error_code ec;
+    boost::filesystem::remove(GetPidFile(), ec);
+    if (ec)
+        printf("Shutdown: could not remove the pid file: %s\n", ec.message().c_str());
+}
+
+void ShutdownFinish(bool fClean)
+{
+    static bool fDone = false;
+    if (fDone)
+        return;
+    fDone = true;
+
+    if (!fClean)
+    {
+        // The flush gets its full time even when the threads used the whole deadline.
+        ArmShutdownWatchdog(SHUTDOWN_FORCED_FLUSH_TIMEOUT_MS);
+        printf("Shutdown: flushing; bounded to %d s\n", (int)(SHUTDOWN_FORCED_FLUSH_TIMEOUT_MS / 1000));
+    }
+
+    if (fInitNodeStarted)
+        DumpAddresses();
+    // On the forced path a secure-messaging thread may still be running, so its DB
+    // stays open (LevelDB writes through) and only smsg.ini is saved.
+    SecureMsgShutdown(fClean);
+    if (fInitDataDirLocked)
+        bitdb.Flush(false);
+
+    if (!fClean)
+    {
+        // A thread is still running and may use anything below, so flush what
+        // can be flushed and leave without freeing anything or running static
+        // destructors. LevelDB writes each record through as it goes and BDB
+        // opens with recovery, so this keeps as much as a normal exit does.
+        if (fInitDataDirLocked)
+        {
+            bitdb.Flush(true);
+            RemovePidFile();
+        }
+        printf("Pinkcoin exited (forced)\n\n");
+        fflush(stdout);
+        fflush(stderr);
+        std::_Exit(0);
+    }
+
+    // Every core thread has stopped: nothing can use what is closed and freed here.
+    if (fInitWalletLoaded)
+        UnregisterWallet(pwalletMain);
+    if (fInitStakeDBLoaded)
+        UnregisterWallet(pstakeDB);
+    if (fInitBlockIndexLoaded)
+        CTxDB().Close();
+    if (fInitDataDirLocked)
+        bitdb.Flush(true);
+    delete pwalletMain;
+    pwalletMain = NULL;
+    delete pstakeDB;
+    pstakeDB = NULL;
+    if (fInitDataDirLocked)
+        RemovePidFile();
+#ifdef WIN32
+    // Bound the rest of the teardown (Qt, static destructors) on Windows.
+    NewThread(ExitTimeout, NULL);
+#endif
+    if (fInitDataDirLocked)
+        printf("Pinkcoin exited\n\n");
 }
 
 void Shutdown(void* parg)
 {
-    static CCriticalSection cs_Shutdown;
-    static bool fTaken;
-
-    // Make this thread recognisable as the shutdown thread
-    RenameThread("pinkcoin-shutoff");
-
-    bool fFirstThread = false;
-    {
-        TRY_LOCK(cs_Shutdown, lockShutdown);
-        if (lockShutdown)
-        {
-            fFirstThread = !fTaken;
-            fTaken = true;
-        }
-    }
-    static bool fExit;
-    if (fFirstThread)
-    {
-        fShutdown = true;
-        
-        if(fSmsg || GetBoolArg("-smsg"))
-        {
-            printf("{SMSG} Status: Shutting down");
-            SecureMsgShutdown();
-        }
-        
-        nTransactionsUpdated++;
-//        CTxDB().Close();
-        bitdb.Flush(false);
-        StopNode();
-        bitdb.Flush(true);
-        boost::filesystem::remove(GetPidFile());
-        UnregisterWallet(pwalletMain);
-        UnregisterWallet(pstakeDB);
-        delete pwalletMain;
-        delete pstakeDB;
-        NewThread(ExitTimeout, NULL);
-        MilliSleep(50);
-        printf("Pinkcoin exited\n\n");
-        fExit = true;
-#ifndef QT_GUI
-        // ensure non-UI client gets exited here, but let Bitcoin-Qt reach 'return 0;' in bitcoin.cpp
-        exit(0);
-#endif
-    }
-    else
-    {
-        while (!fExit)
-            MilliSleep(100);
-        MilliSleep(100);
-        ExitThread(0);
-    }
+    ShutdownFinish(ShutdownStopThreads());
 }
 
 //
@@ -137,6 +345,19 @@ void HandleSIGHUP(int)
 {
     fReopenDebugLog = true;
 }
+
+#if defined(WIN32) && !defined(QT_GUI)
+// Ctrl-C, Ctrl-Break, closing the console window, logoff and system shutdown. The
+// handler runs on its own thread: request the shutdown and wait here, because
+// returning lets Windows end the process at once. The main thread runs the ordered
+// shutdown and ends the process.
+static BOOL WINAPI HandleConsoleCtrl(DWORD dwCtrlType)
+{
+    fRequestShutdown = true;
+    Sleep(INFINITE);
+    return TRUE;
+}
+#endif
 
 
 
@@ -161,7 +382,7 @@ bool AppInit(int argc, char* argv[])
         if (!boost::filesystem::is_directory(GetDataDir(false)))
         {
             fprintf(stderr, "Error: Specified directory does not exist\n");
-            Shutdown(NULL);
+            return false;
         }
         ReadConfigFile(mapArgs, mapMultiArgs);
 
@@ -199,13 +420,20 @@ bool AppInit(int argc, char* argv[])
     } catch (...) {
         PrintException(NULL, "AppInit()");
     }
-    if (!fRet)
-    {
-        Shutdown(NULL);
-        threadGroup.interrupt_all();
-        threadGroup.join_all();
-    }
-    return fRet;
+    if (fRet && fForkedParent)
+        return true; // -daemon: the forked child runs the node
+
+    // The main thread owns shutdown: wait for a shutdown request, then stop and
+    // join every thread here.
+    while (fRet && !fRequestShutdown && !fShutdown)
+        MilliSleep(200);
+    // A shutdown requested during startup (SIGTERM while the block index loads)
+    // is not a failure. Read it before Shutdown(), which sets the flag itself.
+    bool fShutdownRequested = fRequestShutdown;
+    Shutdown(NULL);
+    threadGroup.interrupt_all();
+    threadGroup.join_all();
+    return fRet || fShutdownRequested;
 }
 
 extern void noui_connect();
@@ -218,10 +446,9 @@ int main(int argc, char* argv[])
 
     fRet = AppInit(argc, argv);
 
-    if (fRet && fDaemon)
-        return 0;
-
-    return 1;
+    // AppInit() now returns after a normal shutdown too, not only on failure
+    // or in the -daemon parent.
+    return fRet ? 0 : 1;
 }
 #endif
 
@@ -374,6 +601,17 @@ bool InitSanityCheck(void)
 /** Initialize bitcoin.
  *  @pre Parameters should be parsed and config file should be read.
  */
+// Init checks this between stages: a shutdown requested while init runs (SIGTERM,
+// or a stop) ends init there, and the caller runs the ordered shutdown for the
+// stages that ran.
+static bool InitShutdownRequested(const char* pszStage)
+{
+    if (!fRequestShutdown)
+        return false;
+    printf("Shutdown requested during init (%s)\n", pszStage);
+    return true;
+}
+
 bool AppInit2(boost::thread_group& threadGroup)
 {
     // ********************************************************* Step 1: setup
@@ -417,8 +655,9 @@ bool AppInit2(boost::thread_group& threadGroup)
     sa_hup.sa_flags = 0;
     sigaction(SIGHUP, &sa_hup, NULL);
 #endif
-
-    threadGroup.create_thread(boost::bind(&DetectShutdownThread, &threadGroup));
+#if defined(WIN32) && !defined(QT_GUI)
+    SetConsoleCtrlHandler(HandleConsoleCtrl, TRUE);
+#endif
 
     // ********************************************************* Step 2: parameter interactions
 
@@ -564,6 +803,12 @@ bool AppInit2(boost::thread_group& threadGroup)
 #if !defined(WIN32) && !defined(QT_GUI)
     if (fDaemon)
     {
+        // A lock is not inherited across fork(): the lock above only checks that no
+        // node runs here. Release it, fork, and take it in the child, which keeps it
+        // for the life of the node. Only a child that holds the lock writes the pid
+        // file, so it always names the running node.
+        lock.unlock();
+
         // Daemonize
         pid_t pid = fork();
         if (pid < 0)
@@ -573,15 +818,24 @@ bool AppInit2(boost::thread_group& threadGroup)
         }
         if (pid > 0)
         {
-            CreatePidFile(GetPidFile(), pid);
+            fForkedParent = true;
             return true;
         }
 
         pid_t sid = setsid();
         if (sid < 0)
             fprintf(stderr, "Error: setsid() returned %d errno %d\n", sid, errno);
+
+        if (!lock.try_lock())
+            return InitError(strprintf(_("Cannot obtain a lock on data directory %s.  Pinkcoin is probably already running."), strDataDir.c_str()));
+        CreatePidFile(GetPidFile(), getpid());
     }
 #endif
+    fInitDataDirLocked = true;
+
+    // Started after the -daemon fork, so a forked child's thread group only
+    // holds threads that exist in the child.
+    threadGroup.create_thread(boost::bind(&DetectShutdownThread, &threadGroup));
 
     if (GetBoolArg("-shrinkdebugfile", !fDebug))
         ShrinkDebugFile();
@@ -786,7 +1040,8 @@ bool AppInit2(boost::thread_group& threadGroup)
     {
         uiInterface.InitMessage(_("Starting NTP sync thread..."));
         printf("Starting NTP sync thread...\n");
-        threadGroup.create_thread(boost::bind(threadNTPUpdate, mapArgs["-ntpserver"]));
+        // The pool name lives as long as the thread, which may outlast this scope.
+        StartCoreThread("ntp", ThreadNTPUpdateEntry, new std::string(mapArgs["-ntpserver"]));
     }
 
     // ********************************************************* Step 8: load blockchain
@@ -812,6 +1067,7 @@ bool AppInit2(boost::thread_group& threadGroup)
     nStart = GetTimeMillis();
     if (!LoadBlockIndex())
         return InitError(_("Error loading blkindex.dat"));
+    fInitBlockIndexLoaded = true;
 
 
     // as LoadBlockIndex can take several minutes, it's possible the user
@@ -824,9 +1080,12 @@ bool AppInit2(boost::thread_group& threadGroup)
     }
     printf(" block index %15" PRId64 "ms\n", GetTimeMillis() - nStart);
 
+    // The print-only options end init on purpose: request the stop, so the process
+    // exits 0 as after any requested stop.
     if (GetBoolArg("-printblockindex") || GetBoolArg("-printblocktree"))
     {
         PrintBlockTree();
+        StartShutdown();
         return false;
     }
 
@@ -850,6 +1109,7 @@ bool AppInit2(boost::thread_group& threadGroup)
         }
         if (nFound == 0)
             printf("No blocks matching %s were found\n", strMatch.c_str());
+        StartShutdown();
         return false;
     }
 
@@ -941,7 +1201,9 @@ bool AppInit2(boost::thread_group& threadGroup)
     printf(" wallet      %15" PRId64 "ms\n", GetTimeMillis() - nStart);
 
     RegisterWallet(pwalletMain);
+    fInitWalletLoaded = true;
     RegisterWallet(pstakeDB);
+    fInitStakeDBLoaded = true;
 
     CBlockIndex *pindexRescan = pindexBest;
     if (GetBoolArg("-rescan"))
@@ -962,6 +1224,9 @@ bool AppInit2(boost::thread_group& threadGroup)
         printf(" rescan      %15" PRId64 "ms\n", GetTimeMillis() - nStart);
     }
 
+    if (InitShutdownRequested("wallet loaded"))
+        return false;
+
     // ********************************************************* Step 10: import blocks
 
     if (mapArgs.count("-loadblock"))
@@ -974,7 +1239,10 @@ bool AppInit2(boost::thread_group& threadGroup)
             if (file)
                 LoadExternalBlockFile(file);
         }
-        exit(0);
+        // -loadblock imports and then stops, through the ordered shutdown.
+        printf("Import finished, shutting down (-loadblock)\n");
+        StartShutdown();
+        return false;
     }
 
     boost::filesystem::path pathBootstrap = GetDataDir() / "bootstrap.dat";
@@ -1029,11 +1297,19 @@ bool AppInit2(boost::thread_group& threadGroup)
     printf("mapWallet.size() = %" PRIszu "\n",       pwalletMain->mapWallet.size());
     printf("mapAddressBook.size() = %" PRIszu "\n",  pwalletMain->mapAddressBook.size());
 
-    if (!NewThread(StartNode, NULL))
+    if (InitShutdownRequested("before starting the node"))
+        return false;
+
+    if (!StartCoreThread("net-start", StartNode, NULL))
         InitError(_("Error: could not start node"));
+    else
+        fInitNodeStarted = true;
+
+    if (InitShutdownRequested("before starting RPC"))
+        return false;
 
     if (fServer)
-        NewThread(ThreadRPCServer, NULL);
+        StartCoreThread("rpc-listener", ThreadRPCServer, NULL);
 
     // ********************************************************* Step 13: finished
 
@@ -1046,12 +1322,22 @@ bool AppInit2(boost::thread_group& threadGroup)
      // Add wallet transactions that aren't already in a block to mapTransactions
     pwalletMain->ReacceptWalletTransactions();
 
-#if !defined(QT_GUI)
-    // Loop until process is exit()ed from shutdown() function,
-    // called from ThreadRPCServer thread when a "stop" command is received.
-    while (1)
-        MilliSleep(5000);
+#ifdef PINK2_SHUTDOWN_TEST_HOOKS
+    // Test builds only: a notification command, started the way -walletnotify,
+    // -blocknotify and -alertnotify start theirs.
+    if (mapArgs.count("-shutdownnotifytest"))
+        StartNotifyCommand(GetArg("-shutdownnotifytest", ""));
+    // Test builds only: a registered thread that ignores fShutdown, to exercise
+    // the shutdown backstop.
+    if (GetBoolArg("-shutdownstragglertest"))
+        StartCoreThread("test-straggler", ThreadShutdownStragglerTest, NULL);
+    if (GetBoolArg("-shutdownstragglerlocktest"))
+        StartCoreThread("test-straggler-lock", ThreadShutdownStragglerLockTest, NULL);
+    if (GetBoolArg("-shutdownloglocktest"))
+        StartCoreThread("test-loglock", ThreadShutdownLogLockTest, NULL);
 #endif
 
+    // The daemon's main thread returns to AppInit(), which waits for a shutdown
+    // request; the GUI's returns to its event loop.
     return true;
 }

@@ -70,6 +70,10 @@ enum RPCErrorCode
 json_spirit::Object JSONRPCError(int code, const std::string& message);
 
 void ThreadRPCServer(void* parg);
+/** Wake the RPC listener and every connection waiting for its next request, so
+ *  their threads see fShutdown and end. Call after fShutdown is set. Safe if the
+ *  RPC server never started; idempotent. */
+void StopRPCThreads();
 int CommandLineRPC(int argc, char *argv[]);
 //bool specialOutput(std::string strMethod, std::string *strOut);
 

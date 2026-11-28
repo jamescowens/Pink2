@@ -618,7 +618,7 @@ bool CWallet::AddToWallet(const CWalletTx& wtxIn)
         if ( !strCmd.empty())
         {
             boost::replace_all(strCmd, "%s", wtxIn.GetHash().GetHex());
-            boost::thread t(runCommand, strCmd); // thread runs free
+            StartNotifyCommand(strCmd);
         }
 
     }
@@ -3137,7 +3137,7 @@ DBErrors CWallet::LoadWallet(bool& fFirstRunRet)
         return nLoadWalletRet;
     fFirstRunRet = !vchDefaultKey.IsValid();
 
-    NewThread(ThreadFlushWalletDB, &strWalletFile);
+    StartCoreThread("wallet-flush", ThreadFlushWalletDB, &strWalletFile);
     return DB_LOAD_OK;
 }
 
@@ -3151,7 +3151,7 @@ SDBErrors CWallet::LoadStakeDB(bool& fFirstRunRet)
     if (nLoadStakeDBRet != SDB_LOAD_OK)
         return nLoadStakeDBRet;
 
-    NewThread(ThreadFlushStakeDB, &strWalletFile);
+    StartCoreThread("stakedb-flush", ThreadFlushStakeDB, &strWalletFile);
     return SDB_LOAD_OK;
 }
 
