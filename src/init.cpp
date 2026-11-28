@@ -1059,6 +1059,8 @@ bool AppInit2(boost::thread_group& threadGroup)
         CTxDB txdb("r");
         txdb.LoadBlockIndex();
         PrintBlockTree();
+        // Like the print-only options below, this ends init on purpose.
+        StartShutdown();
         return false;
     }
 
